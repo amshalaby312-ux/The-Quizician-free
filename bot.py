@@ -327,6 +327,16 @@ def year_channel_id(year: str):
 def year_label(year: str) -> str:
     return YEARS.get(year, {}).get("label", year)
 
+# Credit line shown under the module-selection prompt. Year 1 & 2 were
+# built by MDM44; Year 3 is Medify44. Cosmetic only.
+YEAR_CREDITS = {"y1": "MDM44", "y2": "MDM44", "y3": "Medify44"}
+
+def year_credit_line(year: str) -> str:
+    """'\n\nCreated by <b>NAME</b>' for the module-selection screen, or ''
+    if that year has no credit configured."""
+    name = YEAR_CREDITS.get(year)
+    return f"\n\nCreated by <b>{name}</b>" if name else ""
+
 def year_modules(year: str) -> dict:
     return YEARS.get(year, {}).get("modules", {})
 
@@ -6279,7 +6289,7 @@ def _locked_year_modules_view(user_id: int | None, years: list) -> tuple[str, In
     # reopen this exact same screen. Back to Home is the only meaningful
     # "out" from here now.
     buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
-    text = f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:"
+    text = f"📚 <b>{year_label(year_class)}</b> — اختار الموديول:" + year_credit_line(year_class)
     return text, InlineKeyboardMarkup(buttons)
 
 async def quiz_lectures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7571,7 +7581,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"module:{year}:{i}")] for i, m in enumerate(modules)]
         buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="quiz_years")])
         await query.edit_message_text(
-            f"📚 <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
+            f"📚 <b>{year_label(year)}</b> — اختار الموديول:" + year_credit_line(year),
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
