@@ -2842,6 +2842,16 @@ def _shuffled_options(options: list, correct_option_id: int) -> tuple:
     random.shuffle(order)
     return [options[i] for i in order], order.index(correct_option_id)
 
+def _question_content_key(question: str, options: list, prefix: str = "quiz") -> str:
+    """Stable content-based key for a question, used to recognize 'the same
+    question' again later (bookmarks, mistakes bank, report matching)
+    regardless of which delivery/session it came from. NOT cryptographic —
+    just needs to be stable and collision-resistant for this purpose.
+    """
+    normalized = "\x1f".join([str(question or "")] + [str(o or "") for o in (options or [])])
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+    return f"{prefix}:{digest}"
+
 async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Same idea as _deliver_next_lecture_question, but for a self-
     contained Daily Quiz question dict — no mid/channel lookups needed,
@@ -4935,8 +4945,10 @@ async def deliver_quiz(
     labeled_options = [
         f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
     ]
-    q_fits      = len(question) <= TELEGRAM_Q_LIMIT
-    answers_fit = not options_too_long(labeled_options)
+    # One combined check: doesn't matter WHICH part overflows (question or
+    # any option) — either way we fall back to the same "plain text +
+    # bare-letter poll" delivery below.
+    fits = len(question) <= TELEGRAM_Q_LIMIT and not options_too_long(labeled_options)
 
     # chat_id is always the user's own DM here, so it doubles as their user_id.
     timer_seconds = get_question_timer_seconds(chat_id)
@@ -4946,7 +4958,7 @@ async def deliver_quiz(
     metadata.setdefault("options", list(raw_options or []))
     qkey = question_key or _question_content_key(question, raw_options, prefix="quiz")
 
-    if q_fits and answers_fit:
+    if fits:
         main_q, desc_overflow = split_question_for_telegram(question)
 
         if always_show_question_text:
@@ -4976,12 +4988,13 @@ async def deliver_quiz(
         )
 
     else:
-        # Question itself overflows Telegram's poll-question limit (300
-        # chars), regardless of whether the options individually fit.
-        # Send stem + options together as ONE unrevealed text message
-        # (no correct-answer marker — that would spoil the answer before
-        # the poll opens), then deliver a poll with bare A/B/C/D options
-        # so the student just taps a letter against what they just read.
+        # Either the question (>300 chars) or at least one option (>100
+        # chars) overflows Telegram's poll field limits — doesn't matter
+        # which, the fallback is the same. Send the question + all options
+        # together as ONE plain text message (no correct-answer marker —
+        # that would spoil the answer before the poll opens), then deliver
+        # a poll with bare A/B/C/D options so the student just taps a
+        # letter against what they just read.
         answer_lines = "\n".join(
             f"{string.ascii_uppercase[i]}) {opt}"
             for i, opt in enumerate(raw_options)
