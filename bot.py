@@ -12,7 +12,7 @@ import unicodedata
 import tempfile
 import zipfile
 import traceback
-from collections import OrderedDict
+import hashlib
 from io import BytesIO
 from datetime import time as dt_time, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -2100,16 +2100,8 @@ async def restore_lecture_results_from_channel(app):
 # mistakes_bank.json schema:
 # [
 #   {"user_id": int, "mid": int, "year": str, "module": str, "subject": str},
-#   {"user_id": int, "mid": int, "year": str, "module": str, "subject": str,
-#    "kind": "bookmark"},     # <- ❤️-reacted question, see BOOKMARKS below
 #   ...
 # ]
-#
-# BOOKMARKS live in this same list/file/backup, distinguished by
-# "kind": "bookmark" (entries with no "kind" are ordinary mistakes, so
-# existing data needs no migration). They are indexed separately
-# (_BOOKMARKS_BY_USER) so every existing mistakes reader — retake, the
-# menu count, /mystats, Clear Mistake Bank — keeps seeing mistakes only.
 #
 # Entries are lightweight REFERENCES, not self-contained snapshots — just
 # the question's message id (mid) plus enough scoping info to filter by
@@ -2182,14 +2174,6 @@ MISTAKES_BANK: list = load_mistakes_bank()
 # patched to match it at every mutation site (grep _reindex_mistakes,
 # _mistakes_index_add, _mistakes_index_remove to find all of them).
 _MISTAKES_BY_USER: dict[int, list] = {}
-_BOOKMARKS_BY_USER: dict[int, list] = {}   # same idea, for "kind": "bookmark" entries only
-
-def _is_bookmark_entry(m) -> bool:
-    return isinstance(m, dict) and m.get("kind") == "bookmark"
-
-def _index_for(entry) -> dict:
-    """Which per-user index an entry belongs in."""
-    return _BOOKMARKS_BY_USER if _is_bookmark_entry(entry) else _MISTAKES_BY_USER
 
 def _reindex_mistakes_bank() -> None:
     """Rebuilds _MISTAKES_BY_USER from scratch against the current
@@ -2199,16 +2183,15 @@ def _reindex_mistakes_bank() -> None:
     use _mistakes_index_add / _mistakes_index_remove instead, which
     update the index in O(1) rather than rescanning everything."""
     _MISTAKES_BY_USER.clear()
-    _BOOKMARKS_BY_USER.clear()
     for m in MISTAKES_BANK:
         if _is_valid_mistake_entry(m):
-            _index_for(m).setdefault(m["user_id"], []).append(m)
+            _MISTAKES_BY_USER.setdefault(m["user_id"], []).append(m)
 
 def _mistakes_index_add(entry: dict) -> None:
-    _index_for(entry).setdefault(entry["user_id"], []).append(entry)
+    _MISTAKES_BY_USER.setdefault(entry["user_id"], []).append(entry)
 
 def _mistakes_index_remove(entry: dict) -> None:
-    bucket = _index_for(entry).get(entry.get("user_id"))
+    bucket = _MISTAKES_BY_USER.get(entry.get("user_id"))
     if bucket and entry in bucket:
         bucket.remove(entry)
 
@@ -2273,104 +2256,6 @@ async def record_mistake(user_id: int, mid: int, year: str, module: str, subject
     _mistakes_index_add(entry)
     _mark_mistakes_bank_dirty()
     return True
-
-# ── ❤️ BOOKMARKS ───────────────────────────────────────────────────
-# A user reacting ❤️ to a quiz poll saves that question here; removing the
-# reaction un-saves it. Stored in MISTAKES_BANK itself (see schema note),
-# as {"kind": "bookmark"} entries, and surfaced by the main-menu
-# "❤️ Bookmarks" button (bookmarks_menu / bookmarks_retake in
-# button_handler, which reuse the Mistakes Bank retake flow).
-#
-# Telegram's message_reaction update only says "user X reacted to message
-# M in chat C" — it says nothing about which question that message was.
-# So every quiz poll we send that maps to a bank question registers
-# (chat_id, message_id) -> reference in _BOOKMARK_REFS at send time (see
-# _register_bookmarkable call sites). That registry is RAM-only and
-# capped: a ❤️ on a poll sent before the last bot restart is ignored.
-BOOKMARK_REF_CAP = 20000
-_BOOKMARK_REFS: "OrderedDict[tuple[int, int], dict]" = OrderedDict()
-
-def _register_bookmarkable(chat_id, message_id, mid, year, module, subject) -> None:
-    """Remembers that (chat_id, message_id) is a poll for bank question
-    (year, mid), so a later ❤️ reaction can be turned into a bookmark.
-    Silently a no-op if any identifying piece is missing."""
-    if chat_id is None or message_id is None or mid is None or not year:
-        return
-    _BOOKMARK_REFS[(chat_id, message_id)] = {
-        "mid": mid, "year": year, "module": module or "", "subject": subject or "",
-    }
-    while len(_BOOKMARK_REFS) > BOOKMARK_REF_CAP:
-        _BOOKMARK_REFS.popitem(last=False)
-
-def _bookmarks_for(user_id: int) -> list:
-    """This user's bookmark references (never scoped by /daily_module —
-    a bookmark is a personal pick, not part of the daily-quiz pool)."""
-    return list(_BOOKMARKS_BY_USER.get(user_id, []))
-
-def add_bookmark(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
-    """Deduped by (user_id, year, mid). Returns True if a new entry was added."""
-    for b in _BOOKMARKS_BY_USER.get(user_id, []):
-        if b["mid"] == mid and b["year"] == year:
-            return False
-    entry = {"user_id": user_id, "mid": mid, "year": year, "module": module,
-             "subject": subject, "kind": "bookmark"}
-    MISTAKES_BANK.append(entry)
-    _mistakes_index_add(entry)
-    _mark_mistakes_bank_dirty()
-    return True
-
-def remove_bookmark(user_id: int, mid: int, year: str) -> bool:
-    """Returns True if a bookmark was actually removed."""
-    for b in list(_BOOKMARKS_BY_USER.get(user_id, [])):
-        if b["mid"] == mid and b["year"] == year:
-            try:
-                MISTAKES_BANK.remove(b)
-            except ValueError:
-                pass
-            _mistakes_index_remove(b)
-            _mark_mistakes_bank_dirty()
-            return True
-    return False
-
-def _has_heart(reactions) -> bool:
-    """True if a reaction list contains the red heart. Telegram reports it
-    as "❤" while the keyboard emoji is "❤️" (with a variation selector),
-    so compare with the selector stripped."""
-    for r in reactions or ():
-        if isinstance(r, ReactionTypeEmoji) and (r.emoji or "").replace("\ufe0f", "") == "❤":
-            return True
-    return False
-
-async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """❤️ added to a quiz poll -> bookmark it; ❤️ removed -> un-bookmark.
-    Private chats only (chat id == user id). Needs "message_reaction" in
-    run_polling's allowed_updates (see MAIN) — Telegram doesn't send these
-    by default."""
-    mr = update.message_reaction
-    if mr is None or mr.user is None or mr.chat is None or mr.user.is_bot:
-        return
-    user_id = mr.user.id
-    if mr.chat.id != user_id:
-        return
-    # Reaction updates skip the group=-1 ban gate (it only sees messages
-    # and callbacks), so honor bans here too.
-    if get_ban_info(user_id)[0] is not None:
-        return
-    was_hearted, now_hearted = _has_heart(mr.old_reaction), _has_heart(mr.new_reaction)
-    if was_hearted == now_hearted:
-        return
-    ref = _BOOKMARK_REFS.get((mr.chat.id, mr.message_id))
-    if not ref:
-        return
-    try:
-        if now_hearted:
-            changed = add_bookmark(user_id, ref["mid"], ref["year"], ref["module"], ref["subject"])
-        else:
-            changed = remove_bookmark(user_id, ref["mid"], ref["year"])
-        if changed:
-            await backup_mistakes_bank_to_channel(context)
-    except Exception as e:
-        print(f"BOOKMARKS: failed to {'add' if now_hearted else 'remove'} for user {user_id}, mid {ref.get('mid')}: {e}")
 
 async def backup_mistakes_bank_to_channel(context):
     global _mistakes_bank_backup_msg_id, _last_mistakes_bank_backup_at
@@ -2652,7 +2537,6 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
     return {
         "question": question, "options": options, "correct_option_id": correct_id,
         "explanation": explanation, "year": year, "module": module, "subject": subject,
-        "mid": mid,   # lets _deliver_next_daily_question register the poll for ❤️ bookmarking
     }
 
 def _scoped_mistakes_bank(user_id: int) -> list:
@@ -2735,8 +2619,6 @@ def _search_quiz_questions(year: str, module: str | None, query_text: str,
             total += 1
             if len(matches) < limit:
                 matches.append({
-                    "mid":               mid,
-                    "year":              year,
                     "question":          question,
                     "options":           options,
                     "correct_option_id": correct_id,
@@ -2789,8 +2671,6 @@ async def _send_search_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         await deliver_quiz(
             context, chat_id, m["question"], m["options"], m["correct_option_id"],
             explanation=m.get("explanation"),
-            bookmark_ref={"mid": m["mid"], "year": m["year"],
-                          "module": m.get("module", ""), "subject": m.get("subject", "")},
         )
     await context.bot.send_message(chat_id, "🔎 عايز تبحث تاني؟", reply_markup=again_markup)
 
@@ -2934,6 +2814,16 @@ async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str
                 await backup_sessions_to_channel(context)
     return _DAILY_QUIZ_QUESTIONS[year]
 
+def _shuffled_options(options: list, correct_option_id: int) -> tuple:
+    """Returns a shuffled copy of options plus the new index of the
+    correct one. Used per-delivery (not baked into the cached/shared
+    daily question dict) so every user gets their own independent choice
+    order for the same question, rather than everyone seeing option B
+    correct and being able to just compare letters."""
+    order = list(range(len(options)))
+    random.shuffle(order)
+    return [options[i] for i in order], order.index(correct_option_id)
+
 async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Same idea as _deliver_next_lecture_question, but for a self-
     contained Daily Quiz question dict — no mid/channel lookups needed,
@@ -2949,10 +2839,11 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     q = session["queue"].pop(0)
     session["delivered_count"] = session.get("delivered_count", 0) + 1
     timer_seconds = get_question_timer_seconds(user_id)
+    options, correct_option_id = _shuffled_options(q["options"], q["correct_option_id"])
     try:
         msg = await context.bot.send_poll(
-            chat_id=user_id, question=_numbered_question(q["question"], session["delivered_count"]), options=q["options"],
-            type="quiz", correct_option_id=q["correct_option_id"], is_anonymous=False,
+            chat_id=user_id, question=_numbered_question(q["question"], session["delivered_count"]), options=options,
+            type="quiz", correct_option_id=correct_option_id, is_anonymous=False,
             explanation=(q.get("explanation") or None),
             open_period=(timer_seconds or None),
         )
@@ -2960,11 +2851,23 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         print(f"Couldn't send daily quiz question: {e}")
         session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
         return await _deliver_next_daily_question(context, user_id, session)   # try the next one
+    daily_qkey = q.get("question_key") or _question_content_key(
+        q["question"], q.get("options", []), prefix="quiz"
+    )
+    daily_meta = {
+        "question": q.get("question", ""),
+        "options": list(q.get("options", []) or []),
+        "year": q.get("year"),
+        "module": q.get("module"),
+        "subject": q.get("subject"),
+    }
+    _remember_bookmarkable_question(
+        user_id, msg.message_id, question_key=daily_qkey, metadata=daily_meta,
+    )
     session["current_poll_id"]    = msg.poll.id
-    session["current_correct_id"] = q["correct_option_id"]
-    session["current_option_count"] = len(q.get("options") or [])
+    session["current_correct_id"] = correct_option_id
+    session["current_option_count"] = len(options)
     session["current_message_id"] = msg.message_id
-    _register_bookmarkable(user_id, msg.message_id, q.get("mid"), q.get("year"), q.get("module"), q.get("subject"))
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
     # q was popped off the queue above, so stash its module/subject on the
     # session — _advance_daily_quiz_session / _advance_mistakes_retake_session
@@ -3288,7 +3191,7 @@ def _daily_backup_export_file_paths() -> list:
     paths = [
         USERS_FILE, ANALYTICS_FILE, SETTINGS_FILE, LECTURE_RESULTS_FILE,
         MISTAKES_BANK_FILE, STORAGE_INDEX_FILE, STORAGE_BACKUP_STATE_FILE,
-        REPORT_THREADS_FILE,
+        REPORT_THREADS_FILE, QUESTION_REPORTS_FILE,
     ]
     for year in YEAR_ORDER:
         paths += [
@@ -3374,18 +3277,16 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 MISTAKES_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
 
-async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None, source: str = "mistakes") -> None:
+async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
     """Every question currently in this user's mistakes bank, restricted to
     the admin-set /daily_module scope (or the whole bank if no scope is
     set), sent one at a time. No once-per-day gate — unlike the Daily
     Quiz, this is an on-demand review the user can retake as often as they
     like."""
-    is_bm     = source == "bookmarks"   # ❤️ Bookmarks reuse this exact flow, just a different pool
-    entries   = _bookmarks_for(user_id) if is_bm else list(_scoped_mistakes_bank(user_id))
+    entries   = list(_scoped_mistakes_bank(user_id))
     questions = await _resolve_mistakes(context, entries) if entries else []
     if not questions:
-        text = ("📭 مفيش أسئلة محفوظة دلوقتي — حط ❤️ على أي سؤال في الكويز عشان يتحفظ هنا."
-                if is_bm else "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!")
+        text = "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
         if message:
             await message.edit_text(text, reply_markup=keyboard)
@@ -3397,12 +3298,11 @@ async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int
     session = {
         "queue": questions, "current_poll_id": None, "current_correct_id": None,
         "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
-        "kind": "retake", "source": source,
+        "kind": "retake",
     }
     MISTAKES_RETAKE_SESSIONS[user_id] = session
 
-    title = "❤️ <b>مراجعة الأسئلة المحفوظة</b>" if is_bm else "🧠 <b>مراجعة بنك الأخطاء</b>"
-    text = f"{title} — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
+    text = f"🧠 <b>مراجعة بنك الأخطاء</b> — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
     if message:
         await message.edit_text(text, parse_mode=ParseMode.HTML)
     else:
@@ -3467,10 +3367,8 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
         correct   = session["correct"]
         incorrect = session["answered"] - correct
         pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
-        done_title = ("❤️ <b>خلصت مراجعة الأسئلة المحفوظة!</b>" if session.get("source") == "bookmarks"
-                      else "🧠 <b>خلصت مراجعة بنك الأخطاء!</b>")
         summary = (
-            f"{done_title}\n\n"
+            f"🧠 <b>خلصت مراجعة بنك الأخطاء!</b>\n\n"
             f"✅ صح: {correct}\n"
             f"❌ غلط: {incorrect}\n"
             f"📊 نسبة: {pct}%\n"
@@ -3894,6 +3792,63 @@ LECTURE_SESSIONS       = {}    # user_id -> {"year","module","subject","lecture_
                                 #             start so _advance_lecture_session can look up a wrong
                                 #             answer's content in O(1) instead of scanning the whole
                                 #             year} — active one-at-a-time delivery
+# Message IDs of question messages delivered by the bot, keyed by recipient.
+# The bounded list is enough to recognize later ❤️ reactions without letting
+# old questions grow memory usage forever.
+BOOKMARKABLE_QUESTION_MESSAGES = {}   # user_id -> [message_id, ...]
+BOOKMARKABLE_QUESTION_LIMIT = 500
+# user_id -> message_id -> metadata used by bookmark/report reactions.
+# Kept bounded by the same 500-question window as BOOKMARKABLE_QUESTION_MESSAGES.
+QUESTION_MESSAGE_META = {}
+
+# Persistent aggregate report counts, keyed by a stable question key.  A lecture
+# question uses its original year+channel-message id when available; ad-hoc/search
+# questions fall back to a content hash.
+QUESTION_REPORTS_FILE = "question_reports.json"
+QUESTION_REPORTS = _load_json_safe(QUESTION_REPORTS_FILE, dict, dict, "QUESTION REPORTS")
+
+async def save_question_reports():
+    await _write_json_serialized(
+        QUESTION_REPORTS_FILE, lambda: copy.deepcopy(QUESTION_REPORTS), ensure_ascii=False
+    )
+
+def _question_content_key(question: str, options: list | None = None, prefix: str = "question") -> str:
+    raw = question.strip() + "\n" + "\n".join((options or []))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}:{digest}"
+
+def _remember_bookmarkable_question(
+    user_id: int,
+    message_id: int | None,
+    *,
+    question_key: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    if message_id is None:
+        return
+    ids = BOOKMARKABLE_QUESTION_MESSAGES.setdefault(user_id, [])
+    if message_id not in ids:
+        ids.append(message_id)
+    meta = QUESTION_MESSAGE_META.setdefault(user_id, {})
+    if question_key is not None or metadata is not None:
+        payload = dict(metadata or {})
+        if question_key is not None:
+            payload["question_key"] = question_key
+        meta[message_id] = payload
+    if len(ids) > BOOKMARKABLE_QUESTION_LIMIT:
+        stale = ids[:-BOOKMARKABLE_QUESTION_LIMIT]
+        del ids[:-BOOKMARKABLE_QUESTION_LIMIT]
+        for stale_mid in stale:
+            meta.pop(stale_mid, None)
+
+def _is_bookmarkable_question(user_id: int, message_id: int | None) -> bool:
+    return message_id is not None and message_id in BOOKMARKABLE_QUESTION_MESSAGES.get(user_id, [])
+
+def _question_message_meta(user_id: int, message_id: int | None) -> dict | None:
+    if message_id is None:
+        return None
+    return QUESTION_MESSAGE_META.get(user_id, {}).get(message_id)
+
 RETAKE_STAGING         = {}    # user_id -> {"year","module","subject","lecture_key","mids":[mid,...]}
                                 # — wrong-question mids from a just-finished lecture, offered via the
                                 # "🔁 Retake incorrect questions!" button; consumed (popped) once tapped
@@ -3947,6 +3902,29 @@ AWAITING_DEVPANEL_MYSTATS = {}    # admin_id -> True
 # check near the top of handle(). Same RAM-only, restart-is-harmless
 # convention as every other AWAITING_*/PENDING_* dict here.
 AWAITING_SEARCH_QUERY  = {}    # real_uid -> {"year": str, "module": str|None}
+
+# Armed by eqedq:/eqedo:/eqedex: (see the /edit_quiz eqedit: submenu below)
+# to catch the admin's next typed message as the new question/options/
+# explanation for the poll they picked. Popped as soon as it's consumed,
+# same pattern as AWAITING_SEARCH_QUERY above.
+AWAITING_EQEDIT = {}    # real_uid -> {"kind": "question"|"options"|"explanation",
+                         #              "year", "mid", "mod_idx", "subj_idx", "lec_idx"}
+
+# Multiselect-delete staging for /edit_quiz (eqmsstart:/eqmstoggle:/
+# eqmsconfirm/eqmscancel below). Ephemeral UI state only — never
+# persisted, same as the AWAITING_* dicts above; a bot restart mid-
+# selection just means the admin has to start the selection over.
+EQMS_SELECTED = {}    # real_uid -> {"year","mod_idx","subj_idx","lec_idx","lecture_key","mids": set[int]}
+
+# ── /add_lecture: DM-based authoring (no channel involved) ───────────
+# Armed step by step by alyr:/almod:/alsubj: below. AWAITING_ADD_LECTURE_NAME
+# holds the chosen year/module while waiting for the typed "number: name"
+# reply; once that's parsed, ADD_LECTURE_STATE takes over for the actual
+# authoring session (forwarded quiz polls + final -END), and also sets
+# QUIZ_STATE[year]["current_lecture"] so it shares the same single-flight
+# lock the channel-authoring flow already uses — the two can't clash.
+AWAITING_ADD_LECTURE_NAME = {}    # real_uid -> {"year", "module", "subject"}
+ADD_LECTURE_STATE         = {}    # real_uid -> {"year", "lecture_key"}
 
 # ── /broadcast support ────────────────────────────────────────────
 # See the BROADCAST section (grep the banner) further down for the full
@@ -4666,6 +4644,61 @@ def parse_written_channel_block(text: str):
     content = lines[1].strip() if len(lines) > 1 else ""
     return title, content
 
+def _utf16_offset_to_py_index(text: str, offset: int) -> int:
+    """Convert Telegram's UTF-16 code-unit offset to a Python string index."""
+    target = max(0, int(offset))
+    units = 0
+    for index, char in enumerate(text):
+        if units >= target:
+            return index
+        units += len(char.encode("utf-16-le")) // 2
+    return len(text)
+
+def _parse_spoiler_written_parts(text: str, entity_map: dict | None):
+    """Recognize the automatic written-question format:
+
+    Question text + exactly one Telegram spoiler containing the answer.
+    Everything outside the spoiler becomes the question/title. A leading
+    optional W: is stripped so the old explicit marker remains compatible.
+    """
+    text = (text or "").strip()
+    if not text or not entity_map:
+        return None
+    spoilers = [(entity, value) for entity, value in entity_map.items()
+                if getattr(entity, "type", None) == "spoiler"]
+    if len(spoilers) != 1:
+        return None
+    entity, answer = spoilers[0]
+    try:
+        start = _utf16_offset_to_py_index(text, entity.offset)
+        end = _utf16_offset_to_py_index(text, entity.offset + entity.length)
+    except Exception:
+        return None
+    question = (text[:start] + text[end:]).strip()
+    answer = (answer or "").strip()
+    question = re.sub(r"^w\s*:\s*", "", question, count=1, flags=re.IGNORECASE).strip()
+    if not question or not answer:
+        return None
+    return question, answer
+
+def parse_spoiler_written_message(message) -> tuple[str, str] | None:
+    if not message or not message.text:
+        return None
+    try:
+        entities = message.parse_entities(types=["spoiler"])
+    except Exception:
+        return None
+    return _parse_spoiler_written_parts(message.text, entities)
+
+def parse_spoiler_written_caption(message) -> tuple[str, str] | None:
+    if not message or not message.caption:
+        return None
+    try:
+        entities = message.parse_caption_entities(types=["spoiler"])
+    except Exception:
+        return None
+    return _parse_spoiler_written_parts(message.caption, entities)
+
 def split_question_for_telegram(question: str):
     """
     Returns (main_q, description_overflow) where:
@@ -4731,36 +4764,50 @@ def _clear_pending_image(user_id: int):
 # ═══════════════════════════════════════════════════════════════
 # QUIZ DELIVERY  (single source of truth for sending a live quiz poll)
 # ═══════════════════════════════════════════════════════════════
-async def _send_quiz_poll(context, poll_kwargs: dict, image_path: str = None, bookmark_ref: dict | None = None):
+async def _send_quiz_poll(
+    context,
+    poll_kwargs: dict,
+    image_path: str = None,
+    *,
+    question_key: str | None = None,
+    question_meta: dict | None = None,
+):
+    """Send a quiz poll and remember the resulting message as bookmark/reportable.
+    The optional question metadata lets reaction reports identify the same source
+    question across different student deliveries.
     """
-    Sends the poll, attaching image_path as the quiz's native media (Bot API
-    10.0+ InputPollMedia) when provided. Falls back to sending the image as a
-    separate message + a media-less poll if the media attachment is ever
-    rejected — this feature is new enough (May 2026) that we don't want a
-    server-side quirk to silently drop the question entirely.
-    """
-    msg = None
+    metadata = dict(question_meta or {})
+    metadata.setdefault("question", poll_kwargs.get("question", ""))
+    metadata.setdefault("options", list(poll_kwargs.get("options", []) or []))
+    qkey = question_key or _question_content_key(
+        metadata.get("question", ""), metadata.get("options", []), prefix="quiz"
+    )
     if image_path:
         try:
             with open(image_path, "rb") as f:
                 msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(f))
+            _remember_bookmarkable_question(
+                poll_kwargs["chat_id"], msg.message_id, question_key=qkey, metadata=metadata,
+            )
+            return msg
         except Exception as e:
             print("POLL MEDIA ERROR (falling back to separate image message):", e)
             with open(image_path, "rb") as f:
-                await context.bot.send_photo(chat_id=poll_kwargs["chat_id"], photo=f)
-    if msg is None:
-        msg = await context.bot.send_poll(**poll_kwargs)
-    # bookmark_ref (year/mid/module/subject) is only passed for polls that
-    # map to a bank question — see _register_bookmarkable.
-    if bookmark_ref:
-        _register_bookmarkable(poll_kwargs["chat_id"], msg.message_id, **bookmark_ref)
+                image_msg = await context.bot.send_photo(chat_id=poll_kwargs["chat_id"], photo=f)
+            _remember_bookmarkable_question(
+                poll_kwargs["chat_id"], image_msg.message_id, question_key=qkey, metadata=metadata,
+            )
+    msg = await context.bot.send_poll(**poll_kwargs)
+    _remember_bookmarkable_question(
+        poll_kwargs["chat_id"], msg.message_id, question_key=qkey, metadata=metadata,
+    )
     return msg
 
 async def deliver_quiz(
     context, chat_id: int, question: str, raw_options: list, correct_index: int,
     explanation: str = None, image_path: str = None,
     always_show_question_text: bool = False, header_label: str = "📋 <b>السؤال:</b>",
-    bookmark_ref: dict | None = None,
+    question_key: str | None = None, question_meta: dict | None = None,
 ):
     """
     Sends a single live quiz poll to chat_id, handling Telegram's field-length
@@ -4784,21 +4831,27 @@ async def deliver_quiz(
     # chat_id is always the user's own DM here, so it doubles as their user_id.
     timer_seconds = get_question_timer_seconds(chat_id)
     open_period   = timer_seconds if timer_seconds else None
+    metadata = dict(question_meta or {})
+    metadata.setdefault("question", question)
+    metadata.setdefault("options", list(raw_options or []))
+    qkey = question_key or _question_content_key(question, raw_options, prefix="quiz")
 
     if q_fits and answers_fit:
         main_q, desc_overflow = split_question_for_telegram(question)
 
         if always_show_question_text:
-            await context.bot.send_message(
+            stem_msg = await context.bot.send_message(
                 chat_id=chat_id, text=f"{header_label}\n{question}", parse_mode=ParseMode.HTML,
             )
+            _remember_bookmarkable_question(chat_id, stem_msg.message_id, question_key=qkey, metadata=metadata)
 
         if desc_overflow:
-            await context.bot.send_message(
+            overflow_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"📋 <b>تكملة السؤال:</b>\n{desc_overflow}",
                 parse_mode=ParseMode.HTML,
             )
+            _remember_bookmarkable_question(chat_id, overflow_msg.message_id, question_key=qkey, metadata=metadata)
 
         poll_kwargs = dict(
             chat_id=chat_id, question=main_q, options=labeled_options,
@@ -4807,32 +4860,28 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await _send_quiz_poll(context, poll_kwargs, image_path, bookmark_ref)
-
-    elif not q_fits and answers_fit:
-        await context.bot.send_message(
-            chat_id=chat_id, text=f"{header_label}\n{question}", parse_mode=ParseMode.HTML,
+        await _send_quiz_poll(
+            context, poll_kwargs, image_path,
+            question_key=qkey, question_meta=metadata,
         )
-
-        poll_kwargs = dict(
-            chat_id=chat_id, question=".", options=labeled_options,
-            type="quiz", correct_option_id=correct_index, is_anonymous=True,
-            open_period=open_period,
-        )
-        if explanation:
-            poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await _send_quiz_poll(context, poll_kwargs, image_path, bookmark_ref)
 
     else:
+        # Question itself overflows Telegram's poll-question limit (300
+        # chars), regardless of whether the options individually fit.
+        # Send stem + options together as ONE unrevealed text message
+        # (no correct-answer marker — that would spoil the answer before
+        # the poll opens), then deliver a poll with bare A/B/C/D options
+        # so the student just taps a letter against what they just read.
         answer_lines = "\n".join(
-            f"{'✅ ' if i == correct_index else ''}{string.ascii_uppercase[i]}) {opt}"
+            f"{string.ascii_uppercase[i]}) {opt}"
             for i, opt in enumerate(raw_options)
         )
-        await context.bot.send_message(
+        stem_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=f"{header_label}\n{question}\n\n<b>الإجابات:</b>\n{answer_lines}",
+            text=f"{header_label}\n{question}\n\n{answer_lines}",
             parse_mode=ParseMode.HTML,
         )
+        _remember_bookmarkable_question(chat_id, stem_msg.message_id, question_key=qkey, metadata=metadata)
 
         letter_opts = make_letter_only_options(len(raw_options))
         poll_kwargs = dict(
@@ -4842,7 +4891,10 @@ async def deliver_quiz(
         )
         if explanation:
             poll_kwargs["explanation"] = explanation[:TELEGRAM_EX_LIMIT]
-        await _send_quiz_poll(context, poll_kwargs, image_path, bookmark_ref)
+        await _send_quiz_poll(
+            context, poll_kwargs, image_path,
+            question_key=qkey, question_meta=metadata,
+        )
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARD HELPERS
@@ -4862,9 +4914,6 @@ def start_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
-        ],
-        [
-            InlineKeyboardButton("❤️ Bookmarks", callback_data="bookmarks_menu"),
         ],
         [
             InlineKeyboardButton("🏆 Leaderboard", callback_data="year_leaderboard"),
@@ -4922,9 +4971,6 @@ HOW_TO_USE_TEXT = (
     "أول مرة تستخدمه هيطلب منك تحدد سنتك/فرقتك — ومحاولة واحدة بس في اليوم.\n\n"
     "<b>🧠 Mistakes Bank</b>\n"
     "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب.\n\n"
-    "<b>❤️ Bookmarks</b>\n"
-    "حط ❤️ ريأكشن على أي سؤال في الكويز عشان يتحفظ هنا، وراجع أسئلتك المحفوظة وقت ما تحب. "
-    "لو شلت الريأكشن السؤال بيتشال.\n\n"
     "<b>📊 My Stats</b>\n"
     "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها.\n\n"
     "<b>🏆 Leaderboard</b>\n"
@@ -4939,6 +4985,152 @@ HOW_TO_USE_TEXT = (
 # ═══════════════════════════════════════════════════════════════
 # REACTIONS
 # ═══════════════════════════════════════════════════════════════
+async def _reaction_toast(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, *, delay: float = 1.8):
+    """Toast-like acknowledgement for reaction-driven actions.
+
+    Telegram's reaction update has no callback-query toast API, so this is a
+    tiny silent message that disappears shortly afterward.
+    """
+    try:
+        sent = await context.bot.send_message(
+            chat_id=user_id, text=text, disable_notification=True,
+        )
+    except Exception:
+        return
+    async def _remove():
+        await asyncio.sleep(delay)
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=sent.message_id)
+        except Exception:
+            pass
+    asyncio.create_task(_remove())
+
+async def _record_question_report(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    meta: dict,
+    reaction_emoji: str,
+):
+    question_key = meta.get("question_key") or _question_content_key(meta.get("question", ""), meta.get("options", []))
+    entry = QUESTION_REPORTS.setdefault(question_key, {
+        "count": 0,
+        "question": meta.get("question", ""),
+        "options": list(meta.get("options", []) or []),
+        "year": meta.get("year"),
+        "module": meta.get("module"),
+        "subject": meta.get("subject"),
+        "lecture": meta.get("lecture"),
+        "source_mid": meta.get("source_mid"),
+    })
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["last_reported_at"] = int(time.time())
+    if not entry.get("question"):
+        entry["question"] = meta.get("question", "")
+    if not entry.get("options"):
+        entry["options"] = list(meta.get("options", []) or [])
+    await save_question_reports()
+
+    location_bits = [
+        meta.get("year"),
+        meta.get("module"),
+        meta.get("subject"),
+        meta.get("lecture"),
+    ]
+    location = " — ".join(str(x) for x in location_bits if x) or "Unscoped question"
+    source = meta.get("source_mid")
+    source_line = f"\n🆔 Source question: <code>{source}</code>" if source is not None else ""
+    options_text = "\n".join(
+        f"{string.ascii_uppercase[i]}) {html.escape(str(opt))}"
+        for i, opt in enumerate(meta.get("options", []) or [])
+    )
+    report_text = (
+        f"🚨 <b>QUESTION REPORT</b>\n"
+        f"⚠️ Reaction: <b>{html.escape(reaction_emoji)}</b>\n"
+        f"👤 User: <code>{user_id}</code>\n"
+        f"📍 {html.escape(location)}\n"
+        f"🔢 Reports for this question: <b>{entry['count']}</b>"
+        f"{source_line}\n\n"
+        f"<b>Question:</b>\n{html.escape(meta.get('question', '—'))}"
+    )
+    if options_text:
+        report_text += f"\n\n<b>Options:</b>\n{options_text}"
+
+    if ERROR_LOG_GROUP_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ERROR_LOG_GROUP_ID, text=report_text, parse_mode=ParseMode.HTML,
+                disable_notification=True,
+            )
+        except Exception as e:
+            print(f"QUESTION REPORT LOG ERROR for user {user_id}, message {message_id}: {e}")
+    else:
+        print(report_text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
+
+async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles user reactions on questions delivered by Quizician.
+
+    ❤️ = bookmark acknowledgement.
+    😢 / 😭 = report this question as potentially wrong; aggregate count is
+    persisted and the report is copied to ERROR_LOG_GROUP_ID.
+
+    We only act on fresh additions of these reactions and only on question
+    messages remembered by the delivery layer, so ordinary message reactions
+    elsewhere in the chat are ignored.
+    """
+    reaction = update.message_reaction
+    if reaction is None or reaction.user is None:
+        return
+
+    user_id = reaction.user.id
+    chat_id = reaction.chat.id
+    if chat_id != user_id:
+        return
+
+    meta = _question_message_meta(user_id, reaction.message_id)
+    if meta is None:
+        return
+
+    def _emoji_set(reactions):
+        out = set()
+        for item in (reactions or ()):
+            emoji = getattr(item, "emoji", None)
+            if emoji:
+                out.add(emoji)
+        return out
+
+    old_emojis = _emoji_set(reaction.old_reaction)
+    new_emojis = _emoji_set(reaction.new_reaction)
+
+    report_emojis = {"😢", "😭"}
+    old_report = bool(old_emojis & report_emojis)
+    new_report = bool(new_emojis & report_emojis)
+
+    # Report first: it is the more important action if a client replaces an
+    # existing reaction with 😢/😭. Do not double-count a 😢 -> 😭 switch.
+    if new_report and not old_report:
+        chosen = "😭" if "😭" in new_emojis else "😢"
+        await _record_question_report(
+            context, user_id, chat_id, reaction.message_id, meta, chosen,
+        )
+        await _reaction_toast(context, user_id, "Report sent! ^-^")
+        return
+
+    heart_present = bool({"❤️", "❤"} & new_emojis)
+    heart_was_present = bool({"❤️", "❤"} & old_emojis)
+    if heart_present and not heart_was_present:
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=reaction.message_id,
+                reaction=[ReactionTypeEmoji("✍️")],
+                is_big=False,
+            )
+        except Exception as e:
+            print(f"BOOKMARK REACTION ERROR for user {user_id}, message {reaction.message_id}: {e}")
+        await _reaction_toast(context, user_id, "Question bookmarked! ^-^")
+
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
     if not get_reactions_enabled(user_id):
@@ -5149,15 +5341,16 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
     if content:
         caption += f"\n||{escape_markdown(content, version=2)}||"
     image = w.get("image")
+    sent = None
     try:
         if image and image.get("file_id"):
-            await context.bot.send_photo(
+            sent = await context.bot.send_photo(
                 chat_id=user_id, photo=image["file_id"],
                 caption=caption, parse_mode=ParseMode.MARKDOWN_V2,
                 has_spoiler=bool(image.get("spoiler")),
             )
         else:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN_V2,
             )
     except Exception as e:
@@ -5167,11 +5360,26 @@ async def _deliver_written_item(context: ContextTypes.DEFAULT_TYPE, user_id: int
         plain = title + (f"\n{content}" if content else "")
         try:
             if image and image.get("file_id"):
-                await context.bot.send_photo(chat_id=user_id, photo=image["file_id"], caption=plain)
+                sent = await context.bot.send_photo(chat_id=user_id, photo=image["file_id"], caption=plain)
             else:
-                await context.bot.send_message(chat_id=user_id, text=plain)
+                sent = await context.bot.send_message(chat_id=user_id, text=plain)
         except Exception as e2:
             print(f"Fallback plain-text send also failed for written question '{title}': {e2}")
+    if sent is not None:
+        written_key = f"written:{w.get('id', 0)}"
+        written_meta = {
+            "question": title,
+            "options": [],
+            "lecture": w.get("lecture"),
+            "module": w.get("module"),
+            "subject": w.get("subject"),
+            "year": w.get("year"),
+            "source_mid": w.get("id"),
+            "written_answer": content,
+        }
+        _remember_bookmarkable_question(
+            user_id, sent.message_id, question_key=written_key, metadata=written_meta,
+        )
 
 async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
     """Pops message ids off session['queue'] and sends them to the user one
@@ -5339,13 +5547,25 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
             session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
             continue
 
+        lecture_qkey = f"lecture:{year}:{mid}"
+        lecture_meta = {
+            "question": question,
+            "options": list(options or []),
+            "year": year,
+            "module": session.get("module"),
+            "subject": session.get("subject"),
+            "lecture": QUIZ_INDEX.get(year, {}).get(session.get("lecture_key"), {}).get("name", session.get("lecture_key")),
+            "source_mid": mid,
+        }
+        _remember_bookmarkable_question(
+            user_id, msg.message_id, question_key=lecture_qkey, metadata=lecture_meta,
+        )
         session["current_poll_id"]    = msg.poll.id
         session["current_correct_id"] = correct_id
         session["current_option_count"] = len(options)
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
         session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
-        _register_bookmarkable(user_id, msg.message_id, mid, year, session.get("module"), session.get("subject"))
         _schedule_question_timeout(context, session.get("kind", "lecture"), user_id, msg.poll.id, timer_seconds)
         return True
 
@@ -5598,6 +5818,19 @@ async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, u
         print(f"Couldn't send spaced-repetition re-ask for mid {wrong_mid}: {e}")
         return False
 
+    sr_qkey = f"lecture:{session.get('year')}:{wrong_mid}"
+    sr_meta = {
+        "question": status.get("question", ""),
+        "options": list(status.get("options", []) or []),
+        "year": session.get("year"),
+        "module": session.get("module"),
+        "subject": session.get("subject"),
+        "lecture": QUIZ_INDEX.get(session.get("year"), {}).get(session.get("lecture_key"), {}).get("name", session.get("lecture_key")),
+        "source_mid": wrong_mid,
+    }
+    _remember_bookmarkable_question(
+        user_id, msg.message_id, question_key=sr_qkey, metadata=sr_meta,
+    )
     try:
         await context.bot.set_message_reaction(
             chat_id=user_id, message_id=msg.message_id,
@@ -5610,7 +5843,6 @@ async def _maybe_deliver_spaced_repetition(context: ContextTypes.DEFAULT_TYPE, u
     session["sr_pending_poll_id"]    = msg.poll.id
     session["sr_pending_correct_id"] = status["correct_option_id"]
     session["sr_pending_message_id"] = msg.message_id
-    _register_bookmarkable(user_id, msg.message_id, wrong_mid, session.get("year"), session.get("module"), session.get("subject"))
     return True
 
 async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> None:
@@ -5810,11 +6042,181 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
 # ═══════════════════════════════════════════════════════════════
 # FORWARDED POLL HANDLER
 # ═══════════════════════════════════════════════════════════════
+def _add_lecture_item_count(entry: dict) -> int:
+    return len(entry.get("ids", [])) + len(entry.get("written", []))
+
+async def _capture_add_lecture_written(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict, title: str, content: str, message_id: int):
+    """Capture an auto-detected spoiler written question during /add_lecture."""
+    year = al_state["year"]
+    current = al_state["lecture_key"]
+    entry = QUIZ_INDEX[year].get(current)
+    if not entry or entry.get("closed"):
+        ADD_LECTURE_STATE.pop(user_id, None)
+        return
+    entry.setdefault("written", []).append({
+        "id": message_id, "title": title, "content": content, "image": None,
+    })
+    al_state.setdefault("session_written_ids", []).append(message_id)
+    await save_quiz_index(year)
+
+    old_status_id = al_state.get("status_message_id")
+    if old_status_id:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=old_status_id)
+        except Exception:
+            pass
+
+    count = _add_lecture_item_count(entry)
+    sent = await context.bot.send_message(
+        chat_id=user_id,
+        text=f"📚 <b>{current}</b>\n✅ {count} سؤال/جزء اتسجل لحد دلوقتي.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_add_lecture_status_markup(),
+    )
+    al_state["status_message_id"] = sent.message_id
+
+async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, al_state: dict):
+    """Shared close logic for the End Lecture button and typed -END/-FIN.
+    Returns (summary_text, None) on success or (None, error_text)."""
+    year, current = al_state["year"], al_state["lecture_key"]
+    if current not in QUIZ_INDEX[year]:
+        ADD_LECTURE_STATE.pop(real_uid, None)
+        return None, "⚠️ المحاضرة دي اتشالت من حتة تانية."
+    count = _add_lecture_item_count(QUIZ_INDEX[year][current])
+    if count == 0:
+        return None, "⚠️ لسه مفيش أسئلة اتسجلت — ابعت Quiz poll أو سؤال مكتوب وإجابته مخفية بـ Spoiler قبل ما تقفل."
+    QUIZ_INDEX[year][current]["closed"] = True
+    await save_quiz_index(year)
+    QUIZ_STATE[year]["current_lecture"] = None
+    await save_quiz_state(year)
+    ADD_LECTURE_STATE.pop(real_uid, None)
+    # Single backup for the whole lecture, once it's actually closed —
+    # same "batched at close, not per-question" convention the
+    # channel-authoring -END uses.
+    await backup_quiz_to_channel(context, year)
+    return (
+        f"✅ اتقفلت محاضرة <b>{current}</b> — {count} سؤال، وكلهم جاهزين للإرسال على طول "
+        "(مفيش انتظار لإقفال بولات — الإجابات كانت معروفة من ساعة ما اتفورورد).",
+        None,
+    )
+
+async def _cancel_add_lecture(al_state: dict) -> int:
+    """Undoes exactly what this session added: removes only this
+    session's mids (session_ids), and either drops the lecture entry
+    entirely (if it didn't exist before this session) or restores it to
+    however it looked before (if this was a resumed lecture). Returns
+    how many questions were dropped."""
+    year, current = al_state["year"], al_state["lecture_key"]
+    session_ids = al_state.get("session_ids", [])
+    session_written_ids = set(al_state.get("session_written_ids", []))
+    removed_count = len(session_ids) + len(session_written_ids)
+    if current in QUIZ_INDEX[year]:
+        entry = QUIZ_INDEX[year][current]
+        for mid in session_ids:
+            if mid in entry["ids"]:
+                entry["ids"].remove(mid)
+            for pid in [p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS[year].pop(pid, None)
+        if session_written_ids:
+            entry["written"] = [
+                w for w in entry.get("written", [])
+                if w.get("id") not in session_written_ids
+            ]
+            if not entry["written"]:
+                entry.pop("written", None)
+        if al_state.get("existed_before"):
+            entry["closed"] = al_state.get("was_closed_before", False)
+        elif not entry.get("ids") and not entry.get("written"):
+            QUIZ_INDEX[year].pop(current, None)
+        await save_quiz_index(year)
+        await save_quiz_poll_status(year)
+    QUIZ_STATE[year]["current_lecture"] = None
+    await save_quiz_state(year)
+    return removed_count
+
+def _add_lecture_status_markup():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏁 End Lecture", callback_data="alend"),
+        InlineKeyboardButton("❌ Cancel Lecture", callback_data="alcancel"),
+    ]])
+
+async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict):
+    """Captures one forwarded (sender-hidden) quiz poll into QUIZ_INDEX/
+    QUIZ_POLL_STATUS during a /add_lecture DM session. correct_option_id
+    is trusted immediately and "closed" is set True on arrival — unlike
+    the channel flow, there's no waiting for a Stop Poll here, since
+    Telegram already revealed the answer the moment the poll landed in
+    this private chat (see ADD_LECTURE_STATE's comment for why).
+
+    Instead of one confirmation per question, a single running-count
+    message is deleted and resent after each capture, so it always stays
+    the newest message in the chat (right under whatever was just
+    forwarded) rather than getting buried above later forwards — with
+    End Lecture / Cancel Lecture buttons on it throughout."""
+    msg     = update.message
+    poll    = msg.poll
+    year    = al_state["year"]
+    current = al_state["lecture_key"]
+
+    if current not in QUIZ_INDEX[year] or QUIZ_INDEX[year][current]["closed"]:
+        ADD_LECTURE_STATE.pop(user_id, None)
+        await msg.reply_text("⚠️ المحاضرة دي مقفولة أو اتشالت من حتة تانية — ابدأ من /add_lecture تاني.")
+        return
+
+    if poll.type != "quiz":
+        await msg.reply_text("⚠️ ده مش Quiz — لازم الـ poll يكون نوعه Quiz عشان يكون فيه إجابة صح.")
+        return
+
+    if not poll.correct_option_ids:
+        await msg.reply_text(
+            "⚠️ مش عارف الإجابة الصح للسؤال ده. تأكد إنك بتفورورد وشايل اسم المرسل "
+            "(Hide Sender's Name) — فورورد عادي مبيوريش الإجابة."
+        )
+        return
+
+    QUIZ_INDEX[year][current]["ids"].append(msg.message_id)
+    al_state.setdefault("session_ids", []).append(msg.message_id)
+    await save_quiz_index(year)
+
+    QUIZ_POLL_STATUS[year][poll.id] = {
+        "lecture":           current,
+        "message_id":        msg.message_id,
+        "closed":            True,   # answer already known — deliverable right away
+        "correct_option_id": poll.correct_option_ids[0],
+        "question":          poll.question,
+        "options":           [o.text for o in poll.options],
+        "explanation":       poll.explanation,
+    }
+    await save_quiz_poll_status(year)
+
+    old_status_id = al_state.get("status_message_id")
+    if old_status_id:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=old_status_id)
+        except Exception:
+            pass
+
+    count = _add_lecture_item_count(QUIZ_INDEX[year][current])
+    sent = await context.bot.send_message(
+        chat_id=user_id,
+        text=f"📚 <b>{current}</b>\n✅ {count} سؤال/جزء اتسجل لحد دلوقتي.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_add_lecture_status_markup(),
+    )
+    al_state["status_message_id"] = sent.message_id
+
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
         return
 
     user_id = update.effective_chat.id
+
+    # ── /add_lecture is waiting on quiz polls from this admin ────────
+    al_state = ADD_LECTURE_STATE.get(user_id)
+    if al_state:
+        await _capture_add_lecture_poll(update, context, user_id, al_state)
+        return
+
     if user_id in SLEEPING:
         return
 
@@ -6183,7 +6585,9 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
             return
         photo   = msg.photo[-1]   # highest resolution
         caption = (msg.caption or "").strip()
-        written = parse_written_channel_block(caption) if caption else None
+        written = parse_spoiler_written_caption(msg) if caption else None
+        if written is None and caption:
+            written = parse_written_channel_block(caption)
         image_info = {
             "file_id":        photo.file_id,
             "file_unique_id": photo.file_unique_id,   # the immutable part — see QUIZ_PENDING_POLL_IMAGE
@@ -6344,7 +6748,9 @@ async def handle_quiz_channel_message(update: Update, context: ContextTypes.DEFA
     # ── Written question ("w: ...") — unscored reference content, not a
     # poll. Checked before lecture-title parsing so it's never mistaken
     # for (and rejected as) a malformed lecture name. ──────────────────
-    written = parse_written_channel_block(text)
+    written = parse_spoiler_written_message(msg)
+    if written is None:
+        written = parse_written_channel_block(text)
     if written:
         current = QUIZ_STATE[year].get("current_lecture")
         if not current or current not in QUIZ_INDEX[year]:
@@ -6611,6 +7017,25 @@ async def edit_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /add_lecture — DM-based authoring, no channel involved.
+    Year -> module -> subject (alyr:/almod:/alsubj: below) -> typed
+    "number: name" -> then forward quiz polls (sender name hidden) one by
+    one, -END to close. See ADD_LECTURE_STATE's comment for why this
+    works without ever waiting on a Stop Poll."""
+    if not is_admin(update):
+        await update.message.reply_text(MSG_ADMIN_ONLY)
+        return
+    years = configured_years()
+    if not years:
+        await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
+        return
+    buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"alyr:{y}")] for y in years]
+    await update.message.reply_text(
+        "📚 <b>Add Lecture — اختار السنة:</b>", parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
 # ═══════════════════════════════════════════════════════════════
 # TEXT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
@@ -6624,6 +7049,103 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    # ── /add_lecture DM authoring in progress for this admin ─────────
+    # Owns every text message from them until -END/-FIN, exactly the way
+    # the channel-authoring flow owns every channel_post — otherwise a
+    # stray message here could get misread as a search query, nickname,
+    # etc. Quiz polls themselves arrive as update.message.poll, not text,
+    # and are caught in handle_poll (see _capture_add_lecture_poll).
+    al_state = ADD_LECTURE_STATE.get(real_uid)
+    if al_state:
+        if not is_admin(update):
+            return
+        if text.upper() in ("-END", "-FIN"):
+            status_id = al_state.get("status_message_id")
+            summary, err = await _close_add_lecture(context, real_uid, al_state)
+            if status_id:
+                try:
+                    await context.bot.delete_message(chat_id=real_uid, message_id=status_id)
+                except Exception:
+                    pass
+            await update.message.reply_text(err or summary, parse_mode=ParseMode.HTML)
+            return
+
+        auto_written = parse_spoiler_written_message(update.message)
+        if auto_written:
+            title, content = auto_written
+            await _capture_add_lecture_written(
+                context, real_uid, al_state, title, content, update.message.message_id
+            )
+            return
+
+        await update.message.reply_text(
+            "📚 لسه في محاضرة مفتوحة للإضافة — فوروارد سؤال (Quiz) أو ابعت سؤال مكتوب وإجابته مخفية بـ Spoiler، "
+            "أو استخدم زراير End/Cancel Lecture تحت آخر رسالة.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── AWAITING ADD_LECTURE NAME (/add_lecture, after module+subject) ──
+    pending_al_name = AWAITING_ADD_LECTURE_NAME.pop(real_uid, None)
+    if pending_al_name:
+        if not is_admin(update):
+            return
+        m = re.match(r"^\s*(\d+)\s*:\s*(.+)$", text)
+        if not m:
+            await update.message.reply_text(
+                "⚠️ الصيغة غلط. لازم تكون:\n<code>رقم: الاسم</code>\nمثال: <code>3: Insulin Signaling</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            AWAITING_ADD_LECTURE_NAME[real_uid] = pending_al_name
+            return
+        number, name = m.group(1), m.group(2).strip()
+        year, module, subject = pending_al_name["year"], pending_al_name["module"], pending_al_name["subject"]
+
+        current_lock = QUIZ_STATE[year].get("current_lecture")
+        if current_lock and current_lock in QUIZ_INDEX[year] and not QUIZ_INDEX[year][current_lock]["closed"]:
+            await update.message.reply_text(
+                f"⚠️ في محاضرة مفتوحة دلوقتي (<b>{current_lock}</b>) — لازم تتقفل بـ -END الأول.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        lecture_key = f"{module} - {subject} Lecture {number}: {name}"
+        existed_before   = lecture_key in QUIZ_INDEX[year]
+        was_closed_before = QUIZ_INDEX[year][lecture_key]["closed"] if existed_before else False
+        resumed = existed_before and bool(QUIZ_INDEX[year][lecture_key]["ids"])
+        entry = QUIZ_INDEX[year].setdefault(lecture_key, {
+            "ids": [], "closed": False,
+            "module": module, "subject": subject, "lecture_number": number, "name": name,
+        })
+        entry["closed"]         = False
+        entry["module"]         = module
+        entry["subject"]        = subject
+        entry["lecture_number"] = number
+        entry["name"]           = name
+        await save_quiz_index(year)
+        QUIZ_STATE[year]["current_lecture"] = lecture_key
+        await save_quiz_state(year)
+        ADD_LECTURE_STATE[real_uid] = {
+            "year": year, "lecture_key": lecture_key,
+            "existed_before": existed_before, "was_closed_before": was_closed_before,
+            "session_ids": [],            # poll mids added THIS session — what Cancel Lecture undoes
+            "session_written_ids": [],    # written-entry message ids added THIS session
+            "status_message_id": None,    # the one live running-count message
+        }
+
+        resume_note = (
+            f"\n♻️ فيه بالفعل {len(entry['ids'])} سؤال محفوظين هنا — هيتضافوا عليهم."
+            if resumed else ""
+        )
+        await update.message.reply_text(
+            f"🆕 <b>[{year_label(year)}] {module} - {subject} Lecture {number}: {name}</b>{resume_note}\n\n"
+            "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد، وشيل اسم المرسل من كل واحدة "
+            "(Hide Sender's Name) — من غيرها الإجابة الصح مش هتتعرف.\n"
+            "بعد أول سؤال هتلاقي رسالة بعداد الأسئلة وزراير End/Cancel Lecture تحتها.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     # ── "-Reply <id> <message>" (report-issue reply, plain text) ─────
     # Works from REPORT_ISSUE_GROUP_ID regardless of who Telegram reports
@@ -6719,6 +7241,17 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_search = AWAITING_SEARCH_QUERY.pop(real_uid, None)
     if pending_search:
         await _send_search_results(context, user_id, pending_search["year"], pending_search["module"], text)
+        return
+
+    # ── AWAITING EQEDIT (/edit_quiz — typed replacement text) ────────
+    # Armed by eqedq:/eqedo:/eqedex: in button_handler. Admin-gated here
+    # too as defense in depth, same as every other admin AWAITING_* flow
+    # above — the real gate is the "eq" prefix check in button_handler.
+    pending_eqedit = AWAITING_EQEDIT.pop(real_uid, None)
+    if pending_eqedit:
+        if not is_admin(update):
+            return
+        await _apply_eqedit(update, context, pending_eqedit, text)
         return
 
     # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
@@ -6881,6 +7414,17 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # ── MCQ ─────────────────────────────────────────────
             lines = normalize_mcq_block(block)
+
+            if _looks_like_mcq_attempt(lines) and get_nickname(real_uid) is None:
+                # Don't let someone who never finished onboarding create
+                # quiz content anonymously — send them through /start
+                # (which asks for a name) first, same as every other
+                # identified feature in the bot already requires.
+                await update.message.reply_text(
+                    "👋 لازم تعمل /start الأول وتحط اسمك قبل ما تقدر تعمل أسئلة."
+                )
+                return
+
             if len(lines) < 3:
                 # Only warn if this looks like a genuine (but broken)
                 # attempt at a question — i.e. it has at least one
@@ -7034,7 +7578,7 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
             return None
 
         # ── starting a lecture quiz / a Mistakes Bank retake at 3–5 AM ──
-        if data.startswith("lecturego:") or data in ("mistakes_retake", "bookmarks_retake"):
+        if data.startswith("lecturego:") or data == "mistakes_retake":
             return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
 
         # ── Settings: the Spaced Repetition / Auto-Next mismatch warnings.
@@ -7078,6 +7622,149 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
 # INLINE BUTTON HANDLER
 # ═══════════════════════════════════════════════════════════════
 @_serialize_per_user
+def _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx):
+    """Shared lookup+validation for the lecture level of /edit_quiz
+    (eqlecture:/eqmsstart: and friends) — mirrors the inline checks each
+    eq*: branch used to repeat by hand. Returns
+    (error_text_or_None, entry, lecture_key, ids)."""
+    if year not in YEARS or not year_channel_id(year):
+        return "⚠️ السنة دي مش متاحة دلوقتي.", None, None, None
+    modules = ready_modules(year)
+    if mod_idx >= len(modules):
+        return "⚠️ الموديول ده مش موجود دلوقتي.", None, None, None
+    module = modules[mod_idx]
+    subjects = ready_subjects(year, module)
+    if subj_idx >= len(subjects):
+        return "⚠️ المادة دي مش موجودة دلوقتي.", None, None, None
+    subject = subjects[subj_idx]
+    names = ready_lecture_keys(year, module, subject)
+    if lec_idx >= len(names):
+        return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None, None, None
+    lecture_key = names[lec_idx]
+    entry = QUIZ_INDEX[year][lecture_key]
+    return None, entry, lecture_key, entry["ids"]
+
+def _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid):
+    """Shared lookup+validation for the question level of /edit_quiz
+    (eqedit:/eqedq:/eqedo:/eqedex:/eqedc:/eqedcpick: below), built on
+    _eq_resolve_lecture. Returns
+    (error_text_or_None, entry, lecture_key, ids, pid, status) where pid
+    is the poll_id key into QUIZ_POLL_STATUS[year] and status is that
+    entry itself (question/options/correct_option_id/explanation/...)."""
+    err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+    if err:
+        return err, None, None, None, None, None
+    if mid not in ids:
+        return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.", None, None, None, None, None
+    pid = next((p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid), None)
+    status = QUIZ_POLL_STATUS[year].get(pid) if pid else None
+    if not status or not status.get("question") or not status.get("options"):
+        return "⚠️ مفيش بيانات محفوظة للسؤال ده يتعدل (سؤال قديم قبل ما التسجيل يتفعل).", None, None, None, None, None
+    return None, entry, lecture_key, ids, pid, status
+
+async def _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status):
+    """Draws the eqedit: submenu (question/choices/correct-choice/
+    explanation) for one poll. Shared by eqedit: itself and by every
+    flow that lands back on it (eqeditcancel:/eqedcpick:/_apply_eqedit)."""
+    options_preview = "\n".join(
+        f"{string.ascii_uppercase[i]}) {'✅ ' if i == status.get('correct_option_id') else ''}{opt}"
+        for i, opt in enumerate(status["options"])
+    )
+    buttons = [
+        [InlineKeyboardButton("✏️ Edit question", callback_data=f"eqedq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("🔤 Edit choices", callback_data=f"eqedo:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("✅ Choose different correct choice", callback_data=f"eqedc:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("💬 Edit explanation", callback_data=f"eqedex:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+    ]
+    await query.edit_message_text(
+        f"✏️ <b>{entry['name']}</b>\n\n"
+        f"❓ {html.escape(status['question'])}\n\n{html.escape(options_preview)}\n\n"
+        f"💬 {html.escape(status.get('explanation') or '(مفيش explanation)')}\n\n"
+        "اختار حاجة تعدلها:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+def _eqms_keyboard(year, lecture_key, entry, selected: set):
+    """Renders the eqmsstart:/eqmstoggle: multiselect-delete view: the
+    same numbered question list eqlecture: shows, but as togglable
+    checkbox buttons, plus a confirm/cancel row."""
+    ids = entry["ids"]
+    poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
+    lines, number_buttons, row = [], [], []
+    for i, mid in enumerate(ids, 1):
+        status  = poll_status_by_mid.get(mid)
+        preview = html.escape(status["question"][:24]) if status and status.get("question") else "؟؟؟"
+        mark    = "✅" if mid in selected else "⬜"
+        lines.append(f"{mark} {i}. {preview}")
+        row.append(InlineKeyboardButton(f"{mark}{i}", callback_data=f"eqmstoggle:{mid}"))
+        if len(row) == 6:
+            number_buttons.append(row)
+            row = []
+    if row:
+        number_buttons.append(row)
+    number_buttons.append([
+        InlineKeyboardButton(f"🗑 احذف المختار ({len(selected)})", callback_data="eqmsconfirm"),
+        InlineKeyboardButton("❌ إلغاء", callback_data="eqmscancel"),
+    ])
+    text = (
+        f"🗑 <b>{entry['name']}</b> — اختار الأسئلة اللي عايز تحذفها (دوس تحددها، وتاني دوسة تشيلها):\n\n"
+        + "\n".join(lines)
+    )
+    return text, InlineKeyboardMarkup(number_buttons)
+
+async def _apply_eqedit(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict, text: str):
+    """Applies a typed eqedq:/eqedo:/eqedex: reply to the saved poll
+    snapshot in QUIZ_POLL_STATUS — same "channel copy stays archival,
+    only the index/status is authoritative" convention eqdel: already
+    uses — then redraws the eqedit: menu so the admin sees the result
+    right away."""
+    real_uid = update.effective_user.id
+    year, mid = pending["year"], pending["mid"]
+    mod_idx, subj_idx, lec_idx = pending["mod_idx"], pending["subj_idx"], pending["lec_idx"]
+    err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    kind = pending["kind"]
+    warning = ""
+    if kind == "question":
+        question = text.strip()
+        if not question:
+            await update.message.reply_text("⚠️ السؤال فاضي — جرب تاني.")
+            AWAITING_EQEDIT[real_uid] = pending
+            return
+        QUIZ_POLL_STATUS[year][pid]["question"] = question
+
+    elif kind == "options":
+        new_options = [clean_option(l) for l in text.split("\n") if l.strip()]
+        if len(new_options) < 2:
+            await update.message.reply_text("⚠️ لازم اختيارين على الأقل — جرب تاني.")
+            AWAITING_EQEDIT[real_uid] = pending
+            return
+        QUIZ_POLL_STATUS[year][pid]["options"] = new_options
+        old_correct = status.get("correct_option_id")
+        if old_correct is None or old_correct >= len(new_options):
+            QUIZ_POLL_STATUS[year][pid]["correct_option_id"] = None
+            warning = "\n\n⚠️ الإجابة الصح اتشالت لإن الاختيارات اتغيرت — اختار وحدة جديدة."
+
+    elif kind == "explanation":
+        explanation = text.strip()
+        QUIZ_POLL_STATUS[year][pid]["explanation"] = None if explanation == "-" else explanation[:TELEGRAM_EX_LIMIT]
+
+    await save_quiz_poll_status(year)
+    await backup_quiz_to_channel(context, year)
+
+    status = QUIZ_POLL_STATUS[year][pid]
+    buttons = [[InlineKeyboardButton(
+        "↩️ رجوع لتعديل السؤال ده", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"
+    )]]
+    await update.message.reply_text(
+        f"✅ اتحفظ.{warning}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
@@ -7906,7 +8593,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # decided by Randomize just above); OFF (the default) always trails
         # them at the end, in authoring order, even while Randomize is on —
         # see parse_written_channel_block / handle_quiz_channel_message.
-        written_items = [{"type": "written", "data": w} for w in (entry.get("written") or [])]
+        written_items = []
+        for w in (entry.get("written") or []):
+            wd = dict(w)
+            wd.update({
+                "year": year,
+                "module": module,
+                "subject": subject,
+                "lecture": entry.get("name", lecture_key),
+            })
+            written_items.append({"type": "written", "data": wd})
         queue = list(ready_ids)
         if get_mix_written_enabled(user_id):
             for w in written_items:
@@ -7984,13 +8680,126 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # instead of a start/leaderboard preview).
     # ═══════════════════════════════════════════════════════════
 
-    if query.data.startswith("eqyr:") or query.data.startswith("eqmodule:") \
-            or query.data.startswith("eqsubject:") or query.data.startswith("eqlecture:") \
-            or query.data.startswith("eqq:") or query.data.startswith("eqdel:") \
-            or query.data.startswith("eqins:"):
+    # Every /edit_quiz callback lives in the "eq" namespace — eqyr:/
+    # eqmodule:/eqsubject:/eqlecture:/eqq:/eqdel:/eqins:/eqedit:/eqedq:/
+    # eqedo:/eqedex:/eqedc:/eqedcpick:/eqeditcancel:/eqmsstart:/
+    # eqmstoggle:/eqmsconfirm/eqmscancel — so one prefix check covers the
+    # whole flow instead of listing each one by hand and risking a new
+    # sub-flow slipping through ungated.
+    if query.data.startswith("eq"):
         if not is_admin(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
             return
+
+    # Every /add_lecture picker callback lives in the "al" namespace —
+    # alyr_root/alyr:/almod:/alsubj: — same one-prefix-covers-it-all gate
+    # as "eq" above.
+    if query.data.startswith("al"):
+        if not is_admin(update):
+            await query.answer("🚫 للأدمن فقط", show_alert=True)
+            return
+
+    if query.data == "alyr_root":
+        years = configured_years()
+        buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"alyr:{y}")] for y in years]
+        await query.edit_message_text(
+            "📚 <b>Add Lecture — اختار السنة:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if query.data.startswith("alyr:"):
+        _, year = query.data.split(":")
+        modules = ready_modules(year)
+        if not modules:
+            await query.edit_message_text("📭 مفيش موديولات متعرفة للسنة دي.")
+            return
+        buttons = [[InlineKeyboardButton(m, callback_data=f"almod:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="alyr_root")])
+        await query.edit_message_text(
+            f"📚 {year_label(year)} — اختار الموديول:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if query.data.startswith("almod:"):
+        _, year, mod_idx_str = query.data.split(":")
+        mod_idx = int(mod_idx_str)
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if not subjects:
+            await query.edit_message_text("📭 مفيش مواد متعرفة للموديول ده.")
+            return
+        buttons = [
+            [InlineKeyboardButton(s, callback_data=f"alsubj:{year}:{mod_idx}:{i}")]
+            for i, s in enumerate(subjects)
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"alyr:{year}")])
+        await query.edit_message_text(
+            f"📚 {module} — اختار المادة:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if query.data.startswith("alsubj:"):
+        _, year, mod_idx_str, subj_idx_str = query.data.split(":")
+        mod_idx, subj_idx = int(mod_idx_str), int(subj_idx_str)
+        modules = ready_modules(year)
+        if mod_idx >= len(modules):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        module = modules[mod_idx]
+        subjects = ready_subjects(year, module)
+        if subj_idx >= len(subjects):
+            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
+            return
+        subject = subjects[subj_idx]
+
+        # One authoring session per year at a time — shares the exact same
+        # single-flight lock the channel-authoring flow uses
+        # (QUIZ_STATE[year]["current_lecture"]), so a DM session and a
+        # channel session can never clash over the same year.
+        existing_current = QUIZ_STATE[year].get("current_lecture")
+        if existing_current and existing_current in QUIZ_INDEX[year] and not QUIZ_INDEX[year][existing_current]["closed"]:
+            await query.edit_message_text(
+                f"⚠️ في محاضرة مفتوحة دلوقتي (<b>{existing_current}</b>) — لازم تتقفل بـ -END الأول.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        AWAITING_ADD_LECTURE_NAME[user_id] = {"year": year, "module": module, "subject": subject}
+        await query.edit_message_text(
+            f"📚 {module} - {subject}\n\n"
+            "ابعت رقم المحاضرة واسمها بالصيغة:\n<code>رقم: الاسم</code>\n"
+            "مثال: <code>3: Insulin Signaling</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── ALEND: "End Lecture" button on the running-count status message ──
+    if query.data == "alend":
+        al_state = ADD_LECTURE_STATE.get(user_id)
+        if not al_state:
+            await query.edit_message_text("⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+            return
+        summary, err = await _close_add_lecture(context, user_id, al_state)
+        await query.edit_message_text(err or summary, parse_mode=ParseMode.HTML)
+        return
+
+    # ── ALCANCEL: "Cancel Lecture" — drops only what this session added ──
+    if query.data == "alcancel":
+        al_state = ADD_LECTURE_STATE.pop(user_id, None)
+        if not al_state:
+            await query.edit_message_text("⚠️ مفيش محاضرة مفتوحة دلوقتي.")
+            return
+        dropped = await _cancel_add_lecture(al_state)
+        await query.edit_message_text(
+            f"❌ اتلغت المحاضرة. اتشال {dropped} سؤال كان اتسجل في الجلسة دي."
+            if dropped else "❌ اتلغت المحاضرة.",
+        )
+        return
 
     if query.data == "eqyr_root":
         years = configured_years()
@@ -8131,6 +8940,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = []
         if row:
             number_buttons.append(row)
+        number_buttons.append([InlineKeyboardButton(
+            "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+        )])
         number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
         await query.edit_message_text(
             f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n" + "\n".join(lines),
@@ -8173,6 +8985,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = html.escape(status["question"]) if status and status.get("question") else "؟؟؟"
 
         buttons = [
+            [InlineKeyboardButton("✏️ Edit this poll", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("➕ Insert new poll after", callback_data=f"eqins:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
@@ -8279,6 +9092,203 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "دلوقتي ابعت السؤال (أو الأسئلة) الجديدة في القناة — هتتحط بعد السؤال اللي اخترته على طول.\n"
             "لما تخلص، ابعت <code>-END</code> في القناة زي المعتاد.",
             parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── EQEDIT: edit-this-poll submenu (question / choices / correct ──
+    # choice / explanation). Only ever touches the saved QUIZ_POLL_STATUS
+    # snapshot used to resend this question everywhere (lecture delivery,
+    # mistakes bank, daily quiz, search) — same "channel message is just
+    # an archival copy" convention eqdel: above already follows. Telegram
+    # itself has no API to edit a live poll's text/options anyway (only
+    # stop_poll to close one), so the snapshot is the only thing that
+    # actually *can* be edited here.
+    if query.data.startswith("eqedit:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
+        return
+
+    # ── EQEDQ / EQEDO / EQEDEX: arm AWAITING_EQEDIT for the admin's ──
+    # next typed message (see the AWAITING_EQEDIT block in handle()).
+    if query.data.startswith("eqedq:") or query.data.startswith("eqedo:") or query.data.startswith("eqedex:"):
+        prefix = query.data.split(":", 1)[0]
+        kind_map = {"eqedq": "question", "eqedo": "options", "eqedex": "explanation"}
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        AWAITING_EQEDIT[user_id] = {
+            "kind": kind_map[prefix], "year": year, "mid": mid,
+            "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
+        }
+        cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "❌ Cancel", callback_data=f"eqeditcancel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"
+        )]])
+        prompts = {
+            "question": "✏️ ابعت نص السؤال الجديد:",
+            "options": (
+                "🔤 ابعت الاختيارات الجديدة، سطر لكل اختيار (من غير حروف A)/B) — هيتحطوا تلقائي):\n\n"
+                "⚠️ ده بيستبدل كل الاختيارات القديمة. لو عدد الاختيارات اتغير أو الإجابة الصح "
+                "القديمة طلعت برّه المدى الجديد، هتحتاج تختار الإجابة الصح تاني بعدها من "
+                "<b>✅ Choose different correct choice</b>."
+            ),
+            "explanation": "💬 ابعت الـ explanation الجديد (أو ابعت <code>-</code> عشان تشيله):",
+        }
+        await query.edit_message_text(
+            prompts[kind_map[prefix]], parse_mode=ParseMode.HTML, reply_markup=cancel_markup,
+        )
+        return
+
+    # ── EQEDITCANCEL: drop a pending AWAITING_EQEDIT, back to eqedit: ──
+    if query.data.startswith("eqeditcancel:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        AWAITING_EQEDIT.pop(user_id, None)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
+        return
+
+    # ── EQEDC: pick a new correct choice from the current options ──────
+    # (checked before eqedcpick: further down since that's a longer
+    # prefix sharing this one's first few characters)
+    if query.data.startswith("eqedc:") and not query.data.startswith("eqedcpick:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{'✅ ' if i == status.get('correct_option_id') else ''}{string.ascii_uppercase[i]}) {opt[:40]}",
+                callback_data=f"eqedcpick:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}:{i}",
+            )]
+            for i, opt in enumerate(status["options"])
+        ]
+        buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")])
+        await query.edit_message_text("✅ اختار الإجابة الصح الجديدة:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    # ── EQEDCPICK: apply the newly-picked correct choice ───────────────
+    if query.data.startswith("eqedcpick:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str, idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid, new_idx = (
+            int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str), int(idx_str)
+        )
+        err, entry, lecture_key, ids, pid, status = _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+        if new_idx >= len(status["options"]):
+            await query.edit_message_text("⚠️ الاختيار ده مش موجود دلوقتي.")
+            return
+        QUIZ_POLL_STATUS[year][pid]["correct_option_id"] = new_idx
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        status = QUIZ_POLL_STATUS[year][pid]
+        await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
+        return
+
+    # ── EQMSSTART: enter multiselect mode for this lecture's question ──
+    # list (bulk delete instead of one eqdel: tap per question).
+    if query.data.startswith("eqmsstart:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        if not ids:
+            await query.edit_message_text("📭 مفيش أسئلة نحذف منها.")
+            return
+        EQMS_SELECTED[user_id] = {
+            "year": year, "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
+            "lecture_key": lecture_key, "mids": set(),
+        }
+        text, markup = _eqms_keyboard(year, lecture_key, entry, set())
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── EQMSTOGGLE: flip one question's selected/not-selected state ───
+    # Only carries the mid — year/mod/subj/lec live in EQMS_SELECTED,
+    # keyed by user_id, same as every other AWAITING_*-style flow here.
+    if query.data.startswith("eqmstoggle:"):
+        state = EQMS_SELECTED.get(user_id)
+        if not state:
+            await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
+            return
+        mid = int(query.data.split(":", 1)[1])
+        if mid in state["mids"]:
+            state["mids"].discard(mid)
+        else:
+            state["mids"].add(mid)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+        if err:
+            EQMS_SELECTED.pop(user_id, None)
+            await query.edit_message_text(err)
+            return
+        text, markup = _eqms_keyboard(state["year"], lecture_key, entry, state["mids"])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── EQMSCONFIRM: delete every selected question in one go ─────────
+    if query.data == "eqmsconfirm":
+        state = EQMS_SELECTED.pop(user_id, None)
+        if not state or not state["mids"]:
+            await query.edit_message_text("⚠️ مفيش أسئلة متحددة نحذفها.")
+            return
+        year = state["year"]
+        err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+        if err:
+            await query.edit_message_text(err)
+            return
+        deleted = 0
+        for mid in state["mids"]:
+            if mid in ids:
+                ids.remove(mid)
+                deleted += 1
+            for pid in [p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
+                QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_index(year)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        buttons = [[InlineKeyboardButton(
+            "🔙 رجوع للأسئلة",
+            callback_data=f"eqlecture:{state['year']}:{state['mod_idx']}:{state['subj_idx']}:{state['lec_idx']}",
+        )]]
+        await query.edit_message_text(
+            f"🗑 اتشال {deleted} سؤال من <b>{entry['name']}</b>\n"
+            "(الرسايل نفسها لسه موجودة في القناة — احذفها يدوي لو عايز)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── EQMSCANCEL: drop the selection, back to the plain question list ──
+    if query.data == "eqmscancel":
+        state = EQMS_SELECTED.pop(user_id, None)
+        if not state:
+            await query.edit_message_text("تم الإلغاء.")
+            return
+        err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+        if err:
+            await query.edit_message_text(err)
+            return
+        buttons = [[InlineKeyboardButton(
+            "🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{state['year']}:{state['mod_idx']}:{state['subj_idx']}"
+        )]]
+        await query.edit_message_text(
+            f"إلغاء الاختيار. {entry['name']}.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons)
         )
         return
 
@@ -8733,25 +9743,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "mistakes_retake":
         await start_mistakes_retake(context, user_id, message=query.message)
-        return
-
-    # ── ❤️ Bookmarks menu button (main menu, right under Mistakes Bank) ──
-    if query.data == "bookmarks_menu":
-        count = len(_bookmarks_for(user_id))
-        text = (
-            f"❤️ <b>الأسئلة المحفوظة</b>\n\n"
-            f"عدد الأسئلة المحفوظة: <b>{count}</b>\n\n"
-            f"عشان تحفظ سؤال، حط ❤️ ريأكشن على رسالة الكويز. ولو شلت الريأكشن السؤال بيتشال من هنا."
-        )
-        buttons = []
-        if count:
-            buttons.append([InlineKeyboardButton("🔁 Practice Bookmarks", callback_data="bookmarks_retake")])
-        buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if query.data == "bookmarks_retake":
-        await start_mistakes_retake(context, user_id, message=query.message, source="bookmarks")
         return
 
     # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
@@ -10735,6 +11726,8 @@ def _describe_update(update: object) -> str:
         action = "sent a poll"
     elif update.poll_answer:
         action = f"answered poll {update.poll_answer.poll_id}"
+    elif update.message_reaction:
+        action = f"reacted to message {update.message_reaction.message_id}"
     elif update.message:
         action = "sent a non-text message (photo/document/etc.)"
     else:
@@ -10937,6 +11930,7 @@ app.add_handler(CommandHandler("quiz_list",       quiz_list_cmd))
 app.add_handler(CommandHandler("quiz_delete",     quiz_delete_cmd))
 app.add_handler(CommandHandler("edit_quiz",       edit_quiz_cmd))
 app.add_handler(CommandHandler("quiz_edit",       edit_quiz_cmd))
+app.add_handler(CommandHandler("add_lecture",     add_lecture_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls) —
 # excludes the quiz channel, which has its own dedicated handler below.
@@ -10983,10 +11977,7 @@ app.add_handler(MessageHandler(
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
 app.add_handler(PollAnswerHandler(handle_poll_answer))
-# ❤️ reactions on quiz polls -> Bookmarks (see handle_message_reaction)
-app.add_handler(MessageReactionHandler(
-    handle_message_reaction, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
-))
+app.add_handler(MessageReactionHandler(handle_message_reaction))
 
 # Text handler last — excludes the storage group and the quiz channel
 app.add_handler(MessageHandler(
@@ -11063,6 +12054,4 @@ def _print_startup_banner():
     print(f"{DIM}{'─' * 42}{RESET}\n")
 
 _print_startup_banner()
-# message_reaction is NOT in Telegram's default update set — without ALL_TYPES
-# (or an explicit list containing it) ❤️ Bookmarks would never fire.
 app.run_polling(allowed_updates=Update.ALL_TYPES)
