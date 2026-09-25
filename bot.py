@@ -1,5 +1,6 @@
 import re
 import string
+from types import SimpleNamespace
 import random
 import json
 import os
@@ -2127,27 +2128,43 @@ async def restore_lecture_results_from_channel(app):
 MISTAKES_BANK_FILE          = "mistakes_bank.json"
 MISTAKES_BANK_BACKUP_MARKER = "🗑 QUIZICIAN_MISTAKES_BANK_BACKUP"
 
+MISTAKE_ENTRY_TYPE = "mistake"
+BOOKMARK_ENTRY_TYPE = "bookmarked"
+
+def _entry_type(entry: dict) -> str:
+    """Persistent question type inside QUIZICIAN_MISTAKES_BANK.
+
+    Old bank entries pre-date the type field, so a missing field is treated
+    as the original mistake type. Unknown values are also kept conservative
+    and treated as ordinary mistakes rather than as bookmarks."""
+    kind = entry.get("type", MISTAKE_ENTRY_TYPE) if isinstance(entry, dict) else MISTAKE_ENTRY_TYPE
+    return kind if kind in {MISTAKE_ENTRY_TYPE, BOOKMARK_ENTRY_TYPE} else MISTAKE_ENTRY_TYPE
+
 def load_mistakes_bank() -> list:
-    """Loads the local mistakes-bank file, dropping (and logging) any
-    entry missing a required key — including "user_id", added when the
-    bank became per-user; older entries recorded before that change don't
-    have it and are intentionally discarded here rather than migrated, per
-    an explicit decision to start every user's bank fresh instead of
-    guessing at ownership. Every entry this system writes itself (see
-    record_mistake) always has all five keys, so anything missing one
-    didn't come from normal operation and isn't safe to trust downstream.
-    Filtering here means every reader (record_mistake's dedup check,
-    _scoped_mistakes_bank, _resolve_mistake) can keep assuming a
-    well-formed entry without each needing its own defensive check."""
+    """Loads the single shared QUIZICIAN_MISTAKES_BANK file.
+
+    It now stores two question types: type="mistake" and
+    type="bookmarked". Legacy mistake records without a type are normalized
+    to type="mistake" so every reader can explicitly distinguish them."""
     raw = _load_json_safe(MISTAKES_BANK_FILE, list, list, "MISTAKES BANK")
     required = ("user_id", "mid", "year", "module", "subject")
-    clean  = [m for m in raw if isinstance(m, dict) and all(k in m for k in required)]
+    clean = []
+    for item in raw:
+        if not (isinstance(item, dict) and all(k in item for k in required)):
+            continue
+        entry = dict(item)
+        entry["type"] = _entry_type(entry)
+        clean.append(entry)
     if len(clean) != len(raw):
-        print(f"MISTAKES BANK: dropped {len(raw) - len(clean)} malformed/legacy entr(y/ies) missing a required key on load.")
+        print(f"MISTAKES BANK: dropped {len(raw) - len(clean)} malformed entr(y/ies) missing a required key on load.")
     return clean
 
 def _is_valid_mistake_entry(m) -> bool:
-    return isinstance(m, dict) and all(k in m for k in ("user_id", "mid", "year", "module", "subject"))
+    return (
+        isinstance(m, dict)
+        and all(k in m for k in ("user_id", "mid", "year", "module", "subject"))
+        and _entry_type(m) in {MISTAKE_ENTRY_TYPE, BOOKMARK_ENTRY_TYPE}
+    )
 
 async def save_mistakes_bank():
     # See save_analytics for why this snapshot copy is required — this is
@@ -2241,17 +2258,21 @@ async def _flush_mistakes_bank_if_dirty() -> None:
     await save_mistakes_bank()
 
 async def record_mistake(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
-    """Adds a wrong-answer REFERENCE to the bank — just the question id
-    (mid) + scoping info, not the full question text (see schema note
-    above). Deduped by (user_id, year, mid), so the same question missed
-    twice by the same person only ever occupies one slot — but different
-    people missing the same question each get their own entry, since the
-    bank is per-user. Returns whether a new entry was added (False if it
-    was already there — nothing to save/back up in that case)."""
+    """Adds a wrong-answer reference as type="mistake". Bookmark records
+    share the same physical bank but are independent from mistake records."""
     for m in _MISTAKES_BY_USER.get(user_id, []):
+        if _entry_type(m) != MISTAKE_ENTRY_TYPE:
+            continue
         if m["mid"] == mid and m["year"] == year:
             return False
-    entry = {"user_id": user_id, "mid": mid, "year": year, "module": module, "subject": subject}
+    entry = {
+        "user_id": user_id,
+        "type": MISTAKE_ENTRY_TYPE,
+        "mid": mid,
+        "year": year,
+        "module": module,
+        "subject": subject,
+    }
     MISTAKES_BANK.append(entry)
     _mistakes_index_add(entry)
     _mark_mistakes_bank_dirty()
@@ -2540,23 +2561,20 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
     }
 
 def _scoped_mistakes_bank(user_id: int) -> list:
-    """This user's slice of MISTAKES_BANK (via _MISTAKES_BY_USER — see
-    its comment for why), further filtered to the admin-set
-    /daily_module scope, if any. Returns lightweight {user_id, mid,
-    year, module, subject} references — see _resolve_mistake(s) to turn
-    these into full question dicts."""
+    """Returns only this user's type="mistake" records. Bookmark records
+    live in the same bank but are never fed into Mistakes Bank retakes."""
     scope = get_daily_quiz_scope()
-    user_entries = _MISTAKES_BY_USER.get(user_id, [])
+    user_entries = [
+        m for m in _MISTAKES_BY_USER.get(user_id, [])
+        if _entry_type(m) == MISTAKE_ENTRY_TYPE
+    ]
     if not scope:
         return list(user_entries)
     return [m for m in user_entries if m["year"] == scope["year"] and m["module"] == scope["module"]]
 
 def _user_mistake_count(user_id: int) -> int:
-    """This user's total mistake-bank entries, ignoring any admin-set
-    /daily_module scope — for personal displays like /mystats, where the
-    admin's narrowing of the Daily Quiz shouldn't make the user's own
-    bank look smaller than it really is."""
-    return len(_MISTAKES_BY_USER.get(user_id, []))
+    """Counts only type="mistake" records for stats."""
+    return sum(1 for m in _MISTAKES_BY_USER.get(user_id, []) if _entry_type(m) == MISTAKE_ENTRY_TYPE)
 
 def _poll_status_index(year: str) -> dict:
     """{message_id: status} for every poll tracked in QUIZ_POLL_STATUS[year].
@@ -3812,10 +3830,102 @@ async def save_question_reports():
         QUESTION_REPORTS_FILE, lambda: copy.deepcopy(QUESTION_REPORTS), ensure_ascii=False
     )
 
-def _question_content_key(question: str, options: list | None = None, prefix: str = "question") -> str:
-    raw = question.strip() + "\n" + "\n".join((options or []))
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-    return f"{prefix}:{digest}"
+# Personal bookmarks are stored INSIDE MISTAKES_BANK as type="bookmarked".
+# There is intentionally no separate bookmarks.json source of truth anymore.
+BOOKMARKS_PER_USER_LIMIT = 200
+LEGACY_BOOKMARKS_FILE = "bookmarks.json"  # read once for migration only
+
+def _bookmark_entries(user_id: int) -> list:
+    """Returns this user's type="bookmarked" entries from the shared bank."""
+    return [
+        entry for entry in _MISTAKES_BY_USER.get(user_id, [])
+        if _entry_type(entry) == BOOKMARK_ENTRY_TYPE
+    ]
+
+def _bookmark_list(user_id: int) -> list:
+    return list(_bookmark_entries(user_id))
+
+def _bookmark_question(user_id: int, meta: dict) -> bool:
+    """Save/update a full question snapshot as type="bookmarked" in
+    QUIZICIAN_MISTAKES_BANK. Returns True only when newly added."""
+    question = str(meta.get("question", "") or "").strip()
+    options = list(meta.get("options", []) or [])
+    if not question:
+        return False
+
+    question_key = meta.get("question_key") or _question_content_key(
+        question, options, prefix="bookmark"
+    )
+    for item in _bookmark_entries(user_id):
+        if item.get("question_key") == question_key:
+            item.update({
+                "type": BOOKMARK_ENTRY_TYPE,
+                "question": question,
+                "options": options,
+                "correct_option_id": meta.get("correct_option_id"),
+                "explanation": meta.get("explanation"),
+                "year": meta.get("year"),
+                "module": meta.get("module"),
+                "subject": meta.get("subject"),
+                "lecture": meta.get("lecture"),
+                "source_mid": meta.get("source_mid"),
+                "mid": meta.get("source_mid"),
+            })
+            _mark_mistakes_bank_dirty()
+            return False
+
+    entry = {
+        "user_id": user_id,
+        "type": BOOKMARK_ENTRY_TYPE,
+        "mid": meta.get("source_mid"),
+        "year": meta.get("year"),
+        "module": meta.get("module"),
+        "subject": meta.get("subject"),
+        "lecture": meta.get("lecture"),
+        "source_mid": meta.get("source_mid"),
+        "question_key": question_key,
+        "question": question,
+        "options": options,
+        "correct_option_id": meta.get("correct_option_id"),
+        "explanation": meta.get("explanation"),
+        "saved_at": int(time.time()),
+    }
+    MISTAKES_BANK.append(entry)
+    _mistakes_index_add(entry)
+
+    bookmarks = _bookmark_entries(user_id)
+    if len(bookmarks) > BOOKMARKS_PER_USER_LIMIT:
+        oldest = sorted(bookmarks, key=lambda x: x.get("saved_at", 0))[:-BOOKMARKS_PER_USER_LIMIT]
+        for old in oldest:
+            try:
+                MISTAKES_BANK.remove(old)
+            except ValueError:
+                pass
+            _mistakes_index_remove(old)
+    _mark_mistakes_bank_dirty()
+    return True
+
+def _unbookmark_question(user_id: int, meta: dict) -> bool:
+    """Delete the matching type="bookmarked" record from the shared bank."""
+    question_key = meta.get("question_key") or _question_content_key(
+        str(meta.get("question", "") or ""),
+        list(meta.get("options", []) or []),
+        prefix="bookmark",
+    )
+    doomed = [
+        item for item in _bookmark_entries(user_id)
+        if item.get("question_key") == question_key
+    ]
+    if not doomed:
+        return False
+    for item in doomed:
+        try:
+            MISTAKES_BANK.remove(item)
+        except ValueError:
+            pass
+        _mistakes_index_remove(item)
+    _mark_mistakes_bank_dirty()
+    return True
 
 def _remember_bookmarkable_question(
     user_id: int,
@@ -4910,6 +5020,7 @@ def start_menu_keyboard():
             InlineKeyboardButton("⚙️ Settings",  callback_data="menu_settings"),
         ],
         [
+            InlineKeyboardButton("❤️ Bookmarks", callback_data="menu_bookmarks"),
             InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
         ],
         [
@@ -4934,6 +5045,9 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
             [InlineKeyboardButton(f"🔔 Daily Notification: {_tag(daily_notifs)}", callback_data="toggle_daily_notifs")],
             [InlineKeyboardButton(f"📿 Hourly Zikr: {_tag(zikr)}", callback_data="toggle_zikr")],
+            [InlineKeyboardButton("ℹ️ About Us", callback_data="settings_about_us")],
+            [InlineKeyboardButton("🫶 Support Us", callback_data="settings_support_us")],
+            [InlineKeyboardButton("📜 Terms of Service", callback_data="settings_terms")],
             [InlineKeyboardButton("⬅️ Back", callback_data="settings_page:1")],
             [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
         ]
@@ -5071,8 +5185,9 @@ async def _record_question_report(
 async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles user reactions on questions delivered by Quizician.
 
-    ❤️ = bookmark acknowledgement.
-    😢 / 😭 = report this question as potentially wrong; aggregate count is
+    ❤️ = bookmark toggle; removing ❤️ removes the bookmark from the shared bank.
+    😢 / 😭 = report this question as potentially wrong; the bot reacts 🫡,
+    aggregate count is
     persisted and the report is copied to ERROR_LOG_GROUP_ID.
 
     We only act on fresh additions of these reactions and only on question
@@ -5114,12 +5229,27 @@ async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_
         await _record_question_report(
             context, user_id, chat_id, reaction.message_id, meta, chosen,
         )
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=reaction.message_id,
+                reaction=[ReactionTypeEmoji("🫡")],
+                is_big=False,
+            )
+        except Exception as e:
+            print(f"REPORT REACTION ERROR for user {user_id}, message {reaction.message_id}: {e}")
         await _reaction_toast(context, user_id, "Report sent! ^-^")
         return
 
     heart_present = bool({"❤️", "❤"} & new_emojis)
     heart_was_present = bool({"❤️", "❤"} & old_emojis)
     if heart_present and not heart_was_present:
+        saved_new = _bookmark_question(user_id, meta)
+        try:
+            await save_mistakes_bank()
+            await backup_mistakes_bank_to_channel(context)
+        except Exception as e:
+            print(f"BOOKMARK SAVE ERROR for user {user_id}, message {reaction.message_id}: {e}")
         try:
             await context.bot.set_message_reaction(
                 chat_id=chat_id,
@@ -5129,7 +5259,21 @@ async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_
             )
         except Exception as e:
             print(f"BOOKMARK REACTION ERROR for user {user_id}, message {reaction.message_id}: {e}")
-        await _reaction_toast(context, user_id, "Question bookmarked! ^-^")
+        await _reaction_toast(
+            context, user_id,
+            "Question bookmarked! ^-^" if saved_new else "Already bookmarked! ^-^",
+        )
+        return
+
+    if heart_was_present and not heart_present:
+        removed = _unbookmark_question(user_id, meta)
+        if removed:
+            try:
+                await save_mistakes_bank()
+                await backup_mistakes_bank_to_channel(context)
+            except Exception as e:
+                print(f"BOOKMARK REMOVE SAVE ERROR for user {user_id}, message {reaction.message_id}: {e}")
+        await _reaction_toast(context, user_id, "Bookmark removed! ^-^" if removed else "Bookmark not found.")
 
 async def react_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
@@ -7765,6 +7909,60 @@ async def _apply_eqedit(update: Update, context: ContextTypes.DEFAULT_TYPE, pend
         f"✅ اتحفظ.{warning}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+BOOKMARKS_PAGE_SIZE = 5
+
+def _bookmarks_text(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    items = list(reversed(_bookmark_list(user_id)))  # newest first
+    total = len(items)
+    max_page = max(1, (total + BOOKMARKS_PAGE_SIZE - 1) // BOOKMARKS_PAGE_SIZE)
+    page = max(1, min(page, max_page))
+    start = (page - 1) * BOOKMARKS_PAGE_SIZE
+    shown = items[start:start + BOOKMARKS_PAGE_SIZE]
+
+    if not shown:
+        text = (
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'مفيش أسئلة محفوظة لسه! ❤️')}\n\n"
+            "اعمل ❤️ على أي سؤال عشان يتضاف هنا للمراجعة."
+        )
+    else:
+        lines = [
+            f"{quizzy_block(QUIZZY_HAPPY_ART, 'دي الأسئلة اللي حفظتها يا دكتور ❤️')}\n",
+            f"<b>❤️ Bookmarks</b> — {total} سؤال",
+            "",
+        ]
+        for i, item in enumerate(shown, start + 1):
+            question = html.escape(str(item.get("question", "—")))
+            lines.append(f"<b>{i}.</b> {question}")
+            opts = item.get("options", []) or []
+            for j, opt in enumerate(opts):
+                if j >= 8:
+                    lines.append("…")
+                    break
+                lines.append(f"   {string.ascii_uppercase[j]}) {html.escape(str(opt))}")
+            location_bits = [item.get("module"), item.get("subject"), item.get("lecture")]
+            location = " — ".join(str(x) for x in location_bits if x)
+            if location:
+                lines.append(f"   <i>{html.escape(location)}</i>")
+            lines.append("")
+        text = "\n".join(lines).rstrip()
+
+    buttons = []
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"bookmarks_page:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"bookmarks_page:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    return text, InlineKeyboardMarkup(buttons)
+
+async def _send_bookmarks(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, *, edit: bool = False, page: int = 1):
+    text, markup = _bookmarks_text(user_id, page)
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
@@ -9377,6 +9575,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "menu_mystats":
         await _send_mystats(context, user_id, query.message, edit=True)
+        return
+
+    if query.data == "menu_bookmarks":
+        await _send_bookmarks(context, user_id, query.message, edit=True, page=1)
+        return
+
+    if query.data.startswith("bookmarks_page:"):
+        page = int(query.data.split(":", 1)[1])
+        await _send_bookmarks(context, user_id, query.message, edit=True, page=page)
+        return
+
+    if query.data == "settings_about_us":
+        await _send_info_page(context, query, ABOUT_US_TEXT, "About Us")
+        return
+
+    if query.data == "settings_support_us":
+        await _send_info_page(context, query, SUPPORT_US_TEXT, "Support Us")
+        return
+
+    if query.data == "settings_terms":
+        await _send_info_page(context, query, TERMS_OF_SERVICE_TEXT, "Terms of Service")
         return
 
     if query.data == "year_leaderboard" or query.data.startswith("year_leaderboard:"):
@@ -11265,6 +11484,55 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         ]]),
     )
 
+ABOUT_US_TEXT = (
+    f"{quizzy_block(QUIZZY_HAPPY_ART, 'أهلاً يا دكتور المستقبل ❤️')}\n\n"
+    "مرحبا يا عزيزي طبيب المستقبل، تم صنع بوت \"Quizician\" ليكون بوت مساعد في صنع أسئلة تيم كويز، "
+    "وتطور فيما بعد ليصبح منصه كامله لتنزيل الأسئلة وحلها مباشرة مع إضافات العديد من الخدمات مثل تتبع الأخطاء وحفظها لمراجعتها، "
+    "المراجعه التكرارية للأسئلة أول بأول، المنافسات اليوميه على المراكز العاليه بين زملائك، وأشياء آخرى كثير لتحسين قدراتك "
+    "وتهيئتك بأفضل ما يمكن علشان تتفوق في دراستك وتقديراتك.\n\n"
+    "جزيل الشكر لكل من ساعد بأفكاره وإضافاته وتشجيعه، وشكرا لكل حد بيحل أسئلتنا وبيحط ثقته فينا ❤️‍🔥"
+)
+
+SUPPORT_US_TEXT = (
+    f"{quizzy_block(QUIZZY_ADORE_ART, 'كويزي بيحبكم أوي 🥰')}\n\n"
+    "البوت دا معمول علشان يكون 100٪ مجاني ومتاح لكل الدفعات اللي موجودة في MFM\n"
+    "وبدون أي مقابل!\n\n"
+    "تقدر تساعدنا بدعواتك لينا ولآبائنا ولكل حد ساعد فالمشروع ده، وتساعدنا فنشرة بين زمايلك 🫶\n"
+    "ولو عندك أي إضافات أو شكاوي متترددش تتواصل معانا ب /feedback و /report_issue 🫡"
+)
+
+TERMS_OF_SERVICE_TEXT = (
+    "<b>Terms of Service — The Quizician</b>\n"
+    "Last updated: September 24, 2026\n"
+    "By using The Quizician (the “Bot”) on Telegram, you agree to these Terms. "
+    "The Bot is operated by an independent \"Developer\". Contact us via /feedback or /report_issue.\n\n"
+    "<b>1. User-Submitted Content</b>\n"
+    "• If you submit a quiz question to the Bot (in the question/choices/answer format it accepts), you agree that question is free to be shared in any channel, and free to be used as part of the Bot’s Quizzes — by the Developer, without further permission, credit, or compensation to you.\n"
+    "• Only submit content you have the right to share. Do not submit content that is false, plagiarized, or infringes someone else’s rights.\n"
+    "• The Developer may edit, reject, or remove any submitted question at any time, for any reason.\n\n"
+    "<b>2. Acceptable Use</b>\n"
+    "You agree not to:\n"
+    "• Send abusive, hateful, or sexually explicit content to the Bot, its admins, or other users (including in nicknames, feedback, or submitted questions);\n"
+    "• Cheat or manipulate scoring or leaderboards (automation, exploiting bugs, sharing accounts, etc.);\n"
+    "• Attempt to access admin features, other users’ data, or the Bot’s systems without authorization;\n"
+    "• Spam, phish, or otherwise disrupt the Bot’s normal operation;\n"
+    "• Violate Telegram’s own Terms of Service or applicable law while using the Bot.\n"
+    "Violations may lead to a warning, a temporary or permanent ban (via the Bot’s own ban tools), or removal of content, at the Developer’s discretion.\n\n"
+    "<b>3. General</b>\n"
+    "The Bot is a study aid provided “as is,” with no guarantee that quiz content is error-free — report issues with /report_issue. Features, availability, and these Terms may change at any time."
+)
+
+async def _send_info_page(context: ContextTypes.DEFAULT_TYPE, query, text: str, title: str) -> None:
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Settings", callback_data="menu_settings")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]),
+    )
+
+
 async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False, page: int = 1) -> None:
     """Builds and sends the Settings screen to reply_target (an
     update.message or a callback_query.message). Mirrors _send_mystats:
@@ -11402,6 +11670,73 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.HTML,
     )
 
+async def _migrate_legacy_bookmarks_into_mistakes_bank() -> None:
+    """One-time compatibility migration from the old bookmarks.json layout.
+
+    New code never writes bookmarks.json. Existing bookmark snapshots are
+    imported into QUIZICIAN_MISTAKES_BANK as type="bookmarked", deduplicated
+    by user + question_key, and then the shared bank is saved/backed up."""
+    raw = _load_json_safe(LEGACY_BOOKMARKS_FILE, dict, dict, "LEGACY BOOKMARKS")
+    if not raw:
+        return
+
+    added = 0
+    updated_index = False
+    for user_key, items in raw.items():
+        try:
+            uid = int(user_key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(items, list):
+            continue
+
+        existing_keys = {
+            str(item.get("question_key"))
+            for item in _bookmark_entries(uid)
+            if item.get("question_key")
+        }
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            question = str(item.get("question", "") or "").strip()
+            if not question:
+                continue
+            options = list(item.get("options", []) or [])
+            qkey = item.get("question_key") or _question_content_key(
+                question, options, prefix="bookmark"
+            )
+            if qkey in existing_keys:
+                continue
+            entry = {
+                "user_id": uid,
+                "type": BOOKMARK_ENTRY_TYPE,
+                "mid": item.get("source_mid"),
+                "year": item.get("year"),
+                "module": item.get("module"),
+                "subject": item.get("subject"),
+                "lecture": item.get("lecture"),
+                "source_mid": item.get("source_mid"),
+                "question_key": qkey,
+                "question": question,
+                "options": options,
+                "correct_option_id": item.get("correct_option_id"),
+                "explanation": item.get("explanation"),
+                "saved_at": int(item.get("saved_at") or time.time()),
+            }
+            MISTAKES_BANK.append(entry)
+            _mistakes_index_add(entry)
+            existing_keys.add(qkey)
+            added += 1
+            updated_index = True
+
+    if not updated_index:
+        return
+    _mark_mistakes_bank_dirty()
+    await save_mistakes_bank()
+    await backup_mistakes_bank_to_channel(SimpleNamespace(bot=app.bot))
+    print(f"BOOKMARK MIGRATION: imported {added} legacy bookmark(s) into MISTAKES_BANK.")
+
+
 async def _post_init(app):
     """Runs once after the bot connects, before polling starts — restores
     the storage-group and each year's quiz-channel indexes from their
@@ -11441,6 +11776,7 @@ async def _post_init(app):
     await restore_settings_from_channel(app)
     await restore_lecture_results_from_channel(app)
     await restore_mistakes_bank_from_channel(app)
+    await _migrate_legacy_bookmarks_into_mistakes_bank()
     await restore_report_threads_from_channel(app)
     await restore_sessions_from_channel(app)
 
