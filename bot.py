@@ -142,12 +142,11 @@ from zoneinfo import ZoneInfo
 #          (every BACKUP_RECONCILE_INTERVAL seconds) that re-checks each
 #          backup channel's pin and re-uploads if it's out of sync, so a
 #          missed pin/delete on the reactive path gets caught within a few
-#          seconds instead of waiting for the next real data change. Also
-#          registers _zikr_push_job (job_queue.run_repeating, every 3600s,
-#          first fire aligned to the next real clock-hour via
-#          _next_top_of_hour_delay) — hourly zikr to every user who hasn't
-#          opted out via Settings -> More Settings -> Hourly Zikr
-#          (get_zikr_enabled, on by default). Also registers
+#          seconds instead of waiting for the next real data change. The
+#          Zikr poll (_maybe_send_zikr_poll) is usage-based, not a job —
+#          it fires inline every ZIKR_POLL_QUESTION_INTERVAL questions
+#          delivered to a user who hasn't opted out via Settings -> More
+#          Settings -> Zikr (get_zikr_enabled, on by default). Also registers
 #          _daily_backup_export_job (job_queue.run_daily,
 #          DAILY_BACKUP_EXPORT_HOUR/MIN) — zips every local data file and
 #          sends it to ERROR_LOG_GROUP_ID once a day, as a flat-file
@@ -800,7 +799,7 @@ ACHIEVEMENTS = {
 # _settings_customized/_maybe_award_curious — no dedicated tracker field,
 # just a live diff of the user's SETTINGS entry against
 # _blank_settings_entry() every time a preference toggle saves. It needs
-# every watched setting (all except Daily Notification / Hourly Zikr) to be
+# every watched setting (all except Daily Notification / Zikr) to be
 # off its default at the same moment.
 EXTRA_ACHIEVEMENTS = {
     "quick_thinker": ("Quick Thinker", "⚡️", 100, "خلصت محاضرة في أقل من 15 دقيقة",         "سرعة نبيهه ⚡️"),
@@ -913,6 +912,8 @@ def _blank_entry() -> dict:
         "daily_medals":      {"gold": 0, "silver": 0, "bronze": 0},  # lifetime Daily Quiz
                                                                        # leaderboard finishes —
                                                                        # see _finalize_daily_leaderboard
+        "zikr_question_count": 0,   # running count of questions delivered since the last
+                                     # Zikr poll — see _maybe_send_zikr_poll / ZIKR_POLL_QUESTION_INTERVAL
         "telegram_name":     None,   # full display name (first + last), Telegram side
         "telegram_username": None,   # @handle, without the @, or None if not set
         "nickname":          None,   # bot-side nickname (see SETTINGS/get_nickname) —
@@ -1641,8 +1642,8 @@ def _blank_settings_entry() -> dict:
         "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
         "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
         "daily_notifs": True,   # the 2pm 💥Daily Quiz💥 push — see get_daily_notifs_enabled
-        "zikr_reminders": True,   # hourly automated zikr — see get_zikr_enabled / _zikr_push_job. On by
-                                    # default; opt out via Settings -> More Settings -> Hourly Zikr.
+        "zikr_reminders": True,   # Zikr poll every N questions — see get_zikr_enabled / _maybe_send_zikr_poll.
+                                    # On by default; opt out via Settings -> More Settings -> Zikr.
         "banned_until": None,   # epoch seconds (time.time()) this user's /ban lifts at, or None if not
                                  # currently banned — see /ban (ban_cmd), get_ban_info, _ban_gate.
         "ban_reason":   None,   # reason string from their most recent /ban (kept after it lifts too).
@@ -1844,9 +1845,9 @@ def get_daily_notifs_enabled(user_id: int) -> bool:
     return _get_bool_setting(user_id, "daily_notifs")
 
 def get_zikr_enabled(user_id: int) -> bool:
-    """Whether this user gets the hourly automated zikr reminder — see
-    _zikr_push_job. On by default, like the other toggles here (opt out
-    via Settings -> More Settings -> Hourly Zikr)."""
+    """Whether this user gets the Zikr poll every N questions — see
+    _maybe_send_zikr_poll. On by default, like the other toggles here
+    (opt out via Settings -> More Settings -> Zikr)."""
     return _get_bool_setting(user_id, "zikr_reminders")
 
 def get_ban_info(user_id: int) -> tuple[float | None, str | None]:
@@ -2457,7 +2458,7 @@ DAILY_QUIZ_MIN  = 0
 
 # Push time for the daily zipped-backup export (see _daily_backup_export_job
 # and job_queue.run_daily in MAIN). Off-peak hour, well clear of the Daily
-# Quiz push and the hourly Zikr, in the same DAILY_QUIZ_TZ.
+# Quiz push, in DAILY_QUIZ_TZ.
 DAILY_BACKUP_EXPORT_HOUR = 3
 DAILY_BACKUP_EXPORT_MIN  = 0
 
@@ -2903,6 +2904,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["current_module"]  = q.get("module")
     session["current_subject"] = q.get("subject")
     _schedule_question_timeout(context, session.get("kind", "daily"), user_id, msg.poll.id, timer_seconds)
+    await _maybe_send_zikr_poll(context, user_id)
     return True
 
 async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
@@ -3165,46 +3167,51 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
         DAILY_QUIZ_SESSIONS.pop(user_id, None)
         await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
 
-# ── Hourly Zikr reminder — Settings toggle, ON by default ──────────
-# One line sent once an hour, aligned to the real clock hour (1:00pm,
-# 2:00pm, 3:00pm, ... in DAILY_QUIZ_TZ — see _next_top_of_hour_delay
-# and job_queue.run_repeating in MAIN) to every user who's opted in via
-# Settings -> More Settings -> Hourly Zikr. Purely a devotional nudge,
-# no interaction/state of its own — unlike the Daily Quiz push, there's
-# no button or follow-up here. One line is picked at random from the
-# pool each time _zikr_push_job fires, so it's not the same line every
-# hour.
-ZIKR_POOL = [
-    "📿 سبحان الله، والحمدُ لله، ولا إله إلا اللهُ، واللهُ أكبرُ، ولا حولَ ولا قوةَ إلا بالله. ❤️",
-    "📿 سُبْحَانَ اللهِ وَبِحَمْدِهِ، سُبْحَانَ اللهِ الْعَظِيمِ. ❤️",
-    "📿 أَسْتَغْفِرُ اللهَ الَّذِي لَا إِلٰهَ إِلَّا هُوَ، الْحَيُّ الْقَيُّومُ، وَأَتُوبُ إِلَيْهِ. ❤️",
-    "📿 اللَّهُمَّ صَلِّ وَسَلِّمْ وَبَارِكْ عَلَى نَبِيِّنَا مُحَمَّدٍ. ❤️",
+# ── Zikr poll — Settings toggle, ON by default ──────────────────────
+# Was a random one-line text message pushed once an hour to everyone
+# opted in. Now usage-based instead of time-based: a single FIXED
+# multiple-choice (non-quiz) poll, sent to a user every
+# ZIKR_POLL_QUESTION_INTERVAL (7) quiz questions they're delivered —
+# across every live-delivery path (deliver_quiz, lecture sessions,
+# Daily Quiz, spaced-repetition re-asks). Per-user count lives in
+# ANALYTICS[uid]["zikr_question_count"] (see _blank_entry), so it
+# persists across restarts same as every other analytics field. Same
+# opt-out toggle as before (Settings -> More Settings -> Zikr) and same
+# "skip sleeping users" behavior as the old push.
+ZIKR_POLL_QUESTION_INTERVAL = 7
+
+ZIKR_POLL_TITLE = "لا تنسى ذكر الله ❤️❤️"
+ZIKR_POLL_OPTIONS = [
+    "سبحان الله ❤️",
+    "الحمد لله ❤️",
+    "لا إله إلا الله ❤️",
+    "الله أكبر ❤️",
+    "ولا حول ولا قوة الا بالله ❤️",
+    "اللهم صلي وسلم وبارك على نبينا محمد ❤️",
 ]
 
-def _next_top_of_hour_delay(tz: ZoneInfo) -> float:
-    """Seconds from now until the next top of the hour (e.g. 1:00, 2:00,
-    3:00 ...) in `tz`. Used as the `first=` delay for the hourly Zikr
-    job so it lands on real clock-hours instead of firing an hour after
-    whatever moment the bot happened to start."""
-    now = datetime.now(tz)
-    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    return (next_hour - now).total_seconds()
-
-async def _zikr_push_job(context: ContextTypes.DEFAULT_TYPE):
-    """Hourly push (see job_queue.run_repeating in MAIN): a random zikr
-    line from ZIKR_POOL, picked once per firing (so it's the same line
-    for everyone that hour, but varies hour to hour) to every user who's
-    opted in (get_zikr_enabled). Skips sleeping users the same way the
-    Daily Quiz push skips opted-out ones — no reason to nudge someone
-    who's muted the bot."""
-    text = random.choice(ZIKR_POOL)
-    for uid in list(USERS):
-        if uid in SLEEPING or not get_zikr_enabled(uid):
-            continue
-        try:
-            await context.bot.send_message(chat_id=uid, text=text)
-        except Exception:
-            pass   # blocked the bot, deactivated account, etc. — skip silently, same as broadcast_cmd
+async def _maybe_send_zikr_poll(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Call once after EVERY quiz question successfully delivered to
+    `user_id`, from any live-delivery path. Bumps that user's running
+    question count and, every ZIKR_POLL_QUESTION_INTERVAL questions,
+    resets the count and sends the fixed Zikr poll instead of counting
+    that delivery towards anything further."""
+    if user_id in SLEEPING or not get_zikr_enabled(user_id):
+        return
+    entry = _get_entry(user_id)
+    entry["zikr_question_count"] = entry.get("zikr_question_count", 0) + 1
+    if entry["zikr_question_count"] < ZIKR_POLL_QUESTION_INTERVAL:
+        _mark_analytics_dirty()
+        return
+    entry["zikr_question_count"] = 0
+    _mark_analytics_dirty()
+    try:
+        await context.bot.send_poll(
+            chat_id=user_id, question=ZIKR_POLL_TITLE, options=ZIKR_POLL_OPTIONS,
+            type="regular", allows_multiple_answers=True, is_anonymous=True,
+        )
+    except Exception as e:
+        print(f"Couldn't send Zikr poll to {user_id}: {e}")   # blocked the bot, deactivated account, etc.
 
 # ── Daily zipped backup export — a second, independent copy ────────
 # Every JSON file this bot maintains is already kept in sync with a
@@ -3977,6 +3984,10 @@ ONBOARDING_PROMPT_MSG  = {}    # real_uid -> (chat_id, message_id) of the first-
                                 # your name?" prompt, so the nickname reply can edit it in place into
                                 # the Year/Class step instead of sending a new message. Onboarding-only
                                 # (Settings' nickname re-ask isn't tracked here, nothing to flow into).
+PENDING_LECTURE_LINK   = {}    # real_uid -> quick-link payload (see _build_lecture_quicklink_payload),
+                                # stashed when someone taps a lecture quick-link before finishing
+                                # onboarding. Consumed at the true end of onboarding (the "onboard_go"
+                                # tap) instead of the normal welcome menu — see start() and onboard_go.
 
 async def _flow_onboarding_message(update, context, real_uid: int, text: str, **kwargs):
     """Edits the tracked onboarding prompt (ONBOARDING_PROMPT_MSG) in place
@@ -4909,6 +4920,7 @@ async def _send_quiz_poll(
             _remember_bookmarkable_question(
                 poll_kwargs["chat_id"], msg.message_id, question_key=qkey, metadata=metadata,
             )
+            await _maybe_send_zikr_poll(context, poll_kwargs["chat_id"])
             return msg
         except Exception as e:
             print("POLL MEDIA ERROR (falling back to separate image message):", e)
@@ -4921,7 +4933,62 @@ async def _send_quiz_poll(
     _remember_bookmarkable_question(
         poll_kwargs["chat_id"], msg.message_id, question_key=qkey, metadata=metadata,
     )
+    await _maybe_send_zikr_poll(context, poll_kwargs["chat_id"])
     return msg
+
+# ═══════════════════════════════════════════════════════════════
+# QZ WATERMARK — silent anti-theft fingerprint applied only when a
+# question is CREATED through the typed-text format (parse_mcq_lines /
+# parse_mcq_block), never on delivery/re-render of already-stored
+# content, and never on questions authored as native polls in a quiz
+# channel (that pipeline is untouched — see handle_quiz_channel_message).
+#
+# Encodes the 16-bit ASCII pattern for "QZ" (01010001 01011010) one bit
+# per OPTION, in a single running stream that never resets across
+# restarts (persisted to WATERMARK_STATE_FILE): a 1-bit appends a
+# trailing "." to that option's text, a 0-bit leaves it alone. The
+# stream wraps every 16 bits (so every 4 four-option questions is one
+# full "QZ" cycle, but it keeps flowing correctly bit-by-bit even when a
+# question has a different number of options).
+#
+# Whenever the NEXT bit about to be written is bit 0 of a fresh cycle,
+# that question's own stem also gets a trailing "." appended — a marker
+# so anyone decoding a stolen excerpt later can find where a "QZ" cycle
+# starts, even from just a handful of questions rather than the whole
+# bank.
+# ═══════════════════════════════════════════════════════════════
+QZ_WATERMARK_BITS    = "".join(format(ord(c), "08b") for c in "QZ")   # "0101000101011010"
+WATERMARK_STATE_FILE = "watermark_state.json"
+
+_watermark_state      = _load_json_safe(WATERMARK_STATE_FILE, dict, dict, "WATERMARK STATE")
+_WATERMARK_BIT_INDEX  = int(_watermark_state.get("bit_index", 0))
+
+async def _save_watermark_state() -> None:
+    await _write_json_serialized(WATERMARK_STATE_FILE, lambda: {"bit_index": _WATERMARK_BIT_INDEX})
+
+def _apply_qz_watermark(question: str, raw_options: list) -> tuple[str, list]:
+    """Call exactly once per freshly-CREATED typed-text question, right
+    after parsing and before it's delivered/stored. Returns
+    (possibly-dotted question, possibly-dotted options) — never mutates
+    the inputs. Advances the module-level bit stream by len(raw_options)
+    bits; caller is responsible for persisting the new position via
+    _save_watermark_state()."""
+    global _WATERMARK_BIT_INDEX
+    n = len(QZ_WATERMARK_BITS)  # 16
+    watermarked_question = question
+    watermarked_options  = []
+    for opt in raw_options:
+        pos = _WATERMARK_BIT_INDEX % n
+        if pos == 0:
+            # Start of a fresh QZ cycle — mark the question stem.
+            watermarked_question = question.rstrip() + "."
+        bit = QZ_WATERMARK_BITS[pos]
+        opt_text = str(opt).rstrip()
+        if bit == "1":
+            opt_text += "."
+        watermarked_options.append(opt_text)
+        _WATERMARK_BIT_INDEX += 1
+    return watermarked_question, watermarked_options
 
 async def deliver_quiz(
     context, chat_id: int, question: str, raw_options: list, correct_index: int,
@@ -5057,7 +5124,7 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
             [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
             [InlineKeyboardButton(f"🔔 Daily Notification: {_tag(daily_notifs)}", callback_data="toggle_daily_notifs")],
-            [InlineKeyboardButton(f"📿 Hourly Zikr: {_tag(zikr)}", callback_data="toggle_zikr")],
+            [InlineKeyboardButton(f"📿 Zikr: {_tag(zikr)}", callback_data="toggle_zikr")],
             [InlineKeyboardButton("ℹ️ About Us", callback_data="settings_about_us")],
             [InlineKeyboardButton("🫶 Support Us", callback_data="settings_support_us")],
             [InlineKeyboardButton("📜 Terms of Service", callback_data="settings_terms")],
@@ -5724,6 +5791,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         session["current_mid"]        = mid
         session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
         _schedule_question_timeout(context, session.get("kind", "lecture"), user_id, msg.poll.id, timer_seconds)
+        await _maybe_send_zikr_poll(context, user_id)
         return True
 
     session["current_poll_id"]    = None
@@ -6463,6 +6531,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_mcq_block(caption) if caption else None
     if parsed:
         question, raw_options, correct_index, explanation = parsed
+        question, raw_options = _apply_qz_watermark(question, raw_options)
+        await _save_watermark_state()
         await deliver_quiz(
             context, user_id, question, raw_options, correct_index,
             explanation=explanation, image_path=img_path,
@@ -6513,6 +6583,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         question, raw_options, correct_index, explanation = parsed
+        question, raw_options = _apply_qz_watermark(question, raw_options)
+        await _save_watermark_state()
         await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
         events = await _record_activity(real_uid, questions_delta=1)
         _update_telegram_name(real_uid, update.effective_user)
@@ -7618,6 +7690,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # before this message is paired with this question.
             pending_img = PENDING_IMAGE.pop(user_id, None)
 
+            question, raw_options = _apply_qz_watermark(question, raw_options)
+            await _save_watermark_state()
+
             await deliver_quiz(
                 context, user_id, question, raw_options, correct_index,
                 explanation=explanation, image_path=pending_img,
@@ -7974,6 +8049,89 @@ async def _send_bookmarks(context: ContextTypes.DEFAULT_TYPE, user_id: int, repl
     text, markup = _bookmarks_text(user_id, page)
     send = reply_target.edit_text if edit else reply_target.reply_text
     await send(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+# ── Lecture quick-access links — /start deep link straight to a
+# lecture's preview screen (▶️ Start / ❌ Cancel), skipping the normal
+# Year -> Module -> Subject -> Lecture browse. Telegram deep-link
+# payloads only allow [A-Za-z0-9_-], so the payload is just the same
+# year/mod_idx/subj_idx/lec_idx the lecture:/lecturego: callbacks
+# already use, joined with "_" (year itself, e.g. "y1", never contains
+# one). Handed out via the 🔗 button on the lecture preview screen
+# (see the "lecturelink:" branch in button_handler) and consumed in
+# start().
+def _build_lecture_quicklink_payload(year: str, mod_idx: int, subj_idx: int, lec_idx: int) -> str:
+    return f"lec_{year}_{mod_idx}_{subj_idx}_{lec_idx}"
+
+def _parse_lecture_quicklink_payload(payload: str) -> tuple[str, int, int, int] | None:
+    """Returns (year, mod_idx, subj_idx, lec_idx) or None if `payload`
+    isn't a well-formed lecture quick-link (e.g. some other /start
+    param, or a garbled/hand-edited one)."""
+    parts = payload.split("_")
+    if len(parts) != 5 or parts[0] != "lec":
+        return None
+    _, year, mod_idx_str, subj_idx_str, lec_idx_str = parts
+    if not (mod_idx_str.isdigit() and subj_idx_str.isdigit() and lec_idx_str.isdigit()):
+        return None
+    return year, int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+
+def _lecture_preview_view(
+    year: str, mod_idx: int, subj_idx: int, lec_idx: int, user_id: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Builds the lecture preview screen (leaderboard + your best result,
+    ▶️ Start / ❌ Cancel buttons) for one year/mod_idx/subj_idx/lec_idx —
+    or an error string (with no markup) if any index no longer resolves
+    (content renamed/removed since the button or quick-link was made).
+    Shared by the "lecture:" browse callback and the quick-access /start
+    deep link, so both show byte-identical UI."""
+    if year not in YEARS or not year_channel_id(year):
+        return "⚠️ السنة دي مش متاحة دلوقتي.", None
+
+    modules = ready_modules(year)
+    if mod_idx >= len(modules):
+        return "⚠️ الموديول ده مش موجود دلوقتي.", None
+    module = modules[mod_idx]
+    subjects = ready_subjects(year, module)
+    if subj_idx >= len(subjects):
+        return "⚠️ المادة دي مش موجودة دلوقتي.", None
+    subject = subjects[subj_idx]
+    names = ready_lecture_keys(year, module, subject)
+    if lec_idx >= len(names):
+        return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None
+    lecture_key = names[lec_idx]
+    entry = QUIZ_INDEX[year][lecture_key]
+    lr_key = _lr_key(year, lecture_key)
+
+    board = _lecture_leaderboard(lr_key)
+    lines = [
+        quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
+        "",
+        f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b>\n",
+    ]
+    if board:
+        medals = ["🥇", "🥈", "🥉"]
+        lines.append("🏆 <b>أفضل النتائج:</b>")
+        for i, row in enumerate(board):
+            medal = medals[i] if i < len(medals) else f"{i + 1}."
+            lines.append(
+                f"{medal} {html.escape(row['nickname'])} — "
+                f"{row['best_correct']}/{row['best_total']} ({row['best_pct']}%)"
+            )
+    else:
+        lines.append("🏆 محدش خد المحاضرة دي لسه — يلا كن أول واحد!")
+
+    my_result = _get_lecture_results(lr_key).get(str(user_id))
+    if my_result:
+        lines.append(
+            f"\n📌 أحسن نتيجة ليك: {my_result['best_correct']}/{my_result['best_total']} "
+            f"({my_result['best_pct']}%) — حاولت {my_result['attempts']} مرة"
+        )
+
+    buttons = [
+        [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data=f"subject:{year}:{mod_idx}:{subj_idx}")],
+        [InlineKeyboardButton("🔗 لينك سريع للمحاضرة", callback_data=f"lecturelink:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8691,60 +8849,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("lecture:"):
         _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
-        if year not in YEARS or not year_channel_id(year):
-            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
-            return
+        text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, user_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
 
-        modules = ready_modules(year)
-        if mod_idx >= len(modules):
-            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
-            return
-        module = modules[mod_idx]
-        subjects = ready_subjects(year, module)
-        if subj_idx >= len(subjects):
-            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
-            return
-        subject = subjects[subj_idx]
-        names = ready_lecture_keys(year, module, subject)
-        if lec_idx >= len(names):
-            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
-            return
-        lecture_key = names[lec_idx]
-        entry = QUIZ_INDEX[year][lecture_key]
-        lr_key = _lr_key(year, lecture_key)
-
-        board = _lecture_leaderboard(lr_key)
-        lines = [
-            quizzy_block(QUIZZY_READY_ART, "CHALLENGE YOURSELF!"),
-            "",
-            f"🎓 <b>{year_label(year)} — {module} - {subject}: {entry['name']}</b>\n",
-        ]
-        if board:
-            medals = ["🥇", "🥈", "🥉"]
-            lines.append("🏆 <b>أفضل النتائج:</b>")
-            for i, row in enumerate(board):
-                medal = medals[i] if i < len(medals) else f"{i + 1}."
-                lines.append(
-                    f"{medal} {html.escape(row['nickname'])} — "
-                    f"{row['best_correct']}/{row['best_total']} ({row['best_pct']}%)"
-                )
-        else:
-            lines.append("🏆 محدش خد المحاضرة دي لسه — يلا كن أول واحد!")
-
-        my_result = _get_lecture_results(lr_key).get(str(user_id))
-        if my_result:
-            lines.append(
-                f"\n📌 أحسن نتيجة ليك: {my_result['best_correct']}/{my_result['best_total']} "
-                f"({my_result['best_pct']}%) — حاولت {my_result['attempts']} مرة"
-            )
-
-        buttons = [
-            [InlineKeyboardButton("▶️ ابدأ المحاضرة", callback_data=f"lecturego:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
-            [InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"subject:{year}:{mod_idx}:{subj_idx}")],
-        ]
-        await query.edit_message_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
+    # ── LECTURELINK: hand back a shareable https://t.me/<bot>?start=...
+    # deep link for this exact lecture preview screen — see
+    # _build_lecture_quicklink_payload and start()'s handling of it.
+    # Sent as a normal message (not a popup) so it's easy to copy/forward.
+    if query.data.startswith("lecturelink:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+        await query.answer()
+        me = await context.bot.get_me()
+        payload = _build_lecture_quicklink_payload(year, int(mod_idx_str), int(subj_idx_str), int(lec_idx_str))
+        link = f"https://t.me/{me.username}?start={payload}"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔗 <b>لينك سريع للمحاضرة دي:</b>\n"
+                f"{link}\n\n"
+                "أي حد يدوس عليه هيوديه على طول للمحاضرة، وهيلاقي زرار ▶️ ابدأ و❌ إلغاء."
+            ),
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -9765,6 +9891,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "onboard_go":
+        # Onboarding just finished for real — if they got here by tapping
+        # a lecture quick-link before ever finishing onboarding (stashed
+        # in PENDING_LECTURE_LINK by start()), drop them into that
+        # lecture's preview screen instead of the normal welcome menu.
+        pending_payload = PENDING_LECTURE_LINK.pop(user_id, None)
+        parsed = _parse_lecture_quicklink_payload(pending_payload) if pending_payload else None
+        if parsed:
+            year, mod_idx, subj_idx, lec_idx = parsed
+            text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, user_id)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
         # The random Quizzy welcome line already showed as a toast on this
         # tap (see _tap_toast), so the menu message itself is just
         # the greeting — no ASCII cat block repeated underneath it.
@@ -10423,6 +10561,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _update_telegram_name(real_uid, update.effective_user)
     nickname = get_nickname(real_uid)
 
+    # ── Quick-access lecture link — /start payload from a shared
+    # https://t.me/<bot>?start=lec_... link (see _build_lecture_quicklink_payload
+    # / the 🔗 button on the lecture preview screen). Stashed here as soon
+    # as it arrives, BEFORE the onboarding gates below, so someone who
+    # taps a lecture link before ever finishing onboarding doesn't lose
+    # it — onboard_go (the true finish line) checks PENDING_LECTURE_LINK
+    # and drops them straight into the lecture instead of the normal
+    # welcome menu once they're done. An already-onboarded user instead
+    # gets the lecture preview immediately, below.
+    if context.args:
+        PENDING_LECTURE_LINK[real_uid] = context.args[0]
+
     if nickname is None:
         # First-ever /start (no nickname on file yet, for this specific
         # person): ask for one before showing the main menu at all. Marked
@@ -10453,6 +10603,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=year_class_keyboard("onboard_yc"),
         )
         return
+
+    # Fully onboarded already — resolve the pending link (this /start's
+    # own args, just stashed above) right away instead of waiting for
+    # onboard_go, which a fully-onboarded user never taps.
+    pending_payload = PENDING_LECTURE_LINK.pop(real_uid, None)
+    if pending_payload:
+        parsed = _parse_lecture_quicklink_payload(pending_payload)
+        if parsed:
+            year, mod_idx, subj_idx, lec_idx = parsed
+            text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, real_uid)
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
 
     greeting = f"يا {html.escape(nickname)}! "
 
@@ -10580,7 +10742,7 @@ def _build_previewtxt_sections() -> list[str]:
         "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
         "🗑 Clear Mistake Bank · ➡️ More Settings · 🏠 Back to Home\n\n"
         "Settings (page 2): 🎭 Reactions · 🏆 Achievement Alerts · "
-        "🔔 Daily Notification · 📿 Hourly Zikr · ⬅️ Back · 🏠 Back to Home\n\n"
+        "🔔 Daily Notification · 📿 Zikr · ⬅️ Back · 🏠 Back to Home\n\n"
         "── HOW TO USE ──\n\n" + HOW_TO_USE_TEXT
     )
 
@@ -11551,7 +11713,7 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
     update.message or a callback_query.message). Mirrors _send_mystats:
     edit=True rewrites reply_target in place (button flow), edit=False
     sends a fresh reply. page 2 is the "➡️ More Settings" overflow page —
-    Reactions / Achievement Alerts / Daily Notification / Hourly Zikr;
+    Reactions / Achievement Alerts / Daily Notification / Zikr;
     page 1 is everything else (Username, Year/Class, Auto-Next,
     Randomize, Spaced Repetition, Question Timer)."""
     if page == 2:
@@ -11560,7 +11722,7 @@ async def _send_settings(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
             "🎭 <b>Reactions</b>: البوت يرد بإيموجي عشوائي على رسايلك.\n"
             "🏆 <b>Achievement Alerts</b>: تنبيه لما تفتح achievement جديد.\n"
             "🔔 <b>Daily Notification</b>: تنبيه يومي الساعة 2 الضهر لما الـ Daily Quiz يتجدد.\n"
-            "📿 <b>Hourly Zikr</b>: تذكير بالزكر كل ساعة."
+            "📿 <b>Zikr</b>: بوسترة ذكر كل ٧ أسئلة."
         )
     else:
         nickname = get_nickname(user_id)
@@ -11797,7 +11959,7 @@ async def _post_init(app):
         print(
             "⚠️ No JobQueue available — periodic backup reconciliation, the "
             "analytics/settings/mistakes-bank flushes, stale-session cleanup, "
-            "session persistence, the Daily Quiz push, the hourly Zikr "
+            "session persistence, the Daily Quiz push, "
             "reminder, and the daily zipped backup export are disabled. "
             "Local analytics/settings/mistakes-bank changes from hot paths "
             "(poll answers, Daily Quiz starts, wrong answers) will only hit "
@@ -11829,9 +11991,6 @@ async def _post_init(app):
         )
         app.job_queue.run_daily(
             _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
-        )
-        app.job_queue.run_repeating(
-            _zikr_push_job, interval=3600, first=_next_top_of_hour_delay(DAILY_QUIZ_TZ),
         )
         app.job_queue.run_daily(
             _daily_backup_export_job,
