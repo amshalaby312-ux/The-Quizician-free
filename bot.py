@@ -8100,12 +8100,16 @@ async def _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, ent
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-EQ_LIST_PAGE_SIZE = 20   # questions per page on the /edit_quiz "اختار رقم السؤال"
-                          # screen — keeps the listing text safely under
-                          # Telegram's 4096-char message limit even at 60 chars/
-                          # question with a blank line between each (a lecture
-                          # with more than ~25-30 questions used to blow past
-                          # that limit and fail with "message_too_long").
+EQ_LIST_PAGE_SIZE = 40   # questions per page on the /edit_quiz "اختار رقم السؤال"
+                          # screen (and the batch-delete list below it) — sized
+                          # so pagination only ever kicks in for a genuinely
+                          # long lecture: 40 questions x ~75 chars worst case
+                          # (60-char preview + numbering + blank line) is well
+                          # under Telegram's 4096-char message limit, so a
+                          # normal-sized lecture never shows Previous/Next at
+                          # all — see the "if max_page > 1" guards below. Only
+                          # a lecture that would actually risk "message_too_long"
+                          # gets split into pages.
 
 def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page: int = 1):
     """Builds one page of the /edit_quiz "اختار رقم السؤال اللي عايز تعدله"
@@ -9587,8 +9591,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── EQLPAGE: Previous/Next through a long lecture's question list ──
-    # (the eqlecture: screen above, just a different page of it).
+    # (the eqlecture: screen above, just a different page of it). Answers
+    # the tap first — same reasoning as the EQMS* batch-delete handlers
+    # above: clears the button's loading spinner immediately regardless of
+    # what happens next, including the no-op-edit case caught below.
     if query.data.startswith("eqlpage:"):
+        await query.answer()
         _, year, mod_idx_str, subj_idx_str, lec_idx_str, page_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx, page = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(page_str)
         err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
@@ -9605,7 +9613,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         text, markup = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page=page)
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
         return
 
     # ── EQQ: one question picked — show its preview + action buttons ──
