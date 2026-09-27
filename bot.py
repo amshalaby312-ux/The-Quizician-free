@@ -8100,14 +8100,84 @@ async def _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, ent
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-def _eqms_keyboard(year, lecture_key, entry, selected: set):
+EQ_LIST_PAGE_SIZE = 20   # questions per page on the /edit_quiz "اختار رقم السؤال"
+                          # screen — keeps the listing text safely under
+                          # Telegram's 4096-char message limit even at 60 chars/
+                          # question with a blank line between each (a lecture
+                          # with more than ~25-30 questions used to blow past
+                          # that limit and fail with "message_too_long").
+
+def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page: int = 1):
+    """Builds one page of the /edit_quiz "اختار رقم السؤال اللي عايز تعدله"
+    screen for a lecture — first 60 chars of each question (blank line
+    between), plus a numbered grid of buttons below it, plus Previous/Next
+    nav when there's more than one page. Shared by the eqlecture: entry
+    point (page 1) and the eqlpage: pager below. callback_data on each
+    numbered button still carries the question's own immutable channel
+    message_id (mid), NOT its position in `ids`, since positions shift
+    whenever an earlier question in this same lecture gets deleted (see
+    eqq:/eqdel:/eqins: further down, which all look the question up by mid
+    rather than trusting an index)."""
+    ids = entry["ids"]
+    total = len(ids)
+    max_page = max(1, (total + EQ_LIST_PAGE_SIZE - 1) // EQ_LIST_PAGE_SIZE)
+    page = max(1, min(page, max_page))
+    start = (page - 1) * EQ_LIST_PAGE_SIZE
+    page_items = list(enumerate(ids, 1))[start:start + EQ_LIST_PAGE_SIZE]
+
+    poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
+    lines = []
+    number_buttons, row = [], []
+    for i, mid in page_items:
+        status = poll_status_by_mid.get(mid)
+        preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
+        lines.append(f"{i}. {preview}")
+        row.append(InlineKeyboardButton(str(i), callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"))
+        if len(row) == 6:
+            number_buttons.append(row)
+            row = []
+    if row:
+        number_buttons.append(row)
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"eqlpage:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"eqlpage:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{page+1}"))
+    if nav:
+        number_buttons.append(nav)
+
+    number_buttons.append([InlineKeyboardButton(
+        "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+    )])
+    number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
+
+    page_note = f" (صفحة {page}/{max_page})" if max_page > 1 else ""
+    text = (
+        f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله{page_note}:\n\n"
+        + "\n\n".join(lines)
+    )
+    return text, InlineKeyboardMarkup(number_buttons)
+
+def _eqms_keyboard(year, lecture_key, entry, selected: set, page: int = 1):
     """Renders the eqmsstart:/eqmstoggle: multiselect-delete view: the
     same numbered question list eqlecture: shows, but as togglable
-    checkbox buttons, plus a confirm/cancel row."""
+    checkbox buttons, plus a confirm/cancel row. Paginated the same way
+    (EQ_LIST_PAGE_SIZE/page) and for the same reason — a long lecture's
+    full list can trip Telegram's message-length limit. The "احذف
+    المختار" count always reflects every selected question across every
+    page, not just the one currently shown, since `selected` is the
+    session-wide set."""
     ids = entry["ids"]
+    total = len(ids)
+    max_page = max(1, (total + EQ_LIST_PAGE_SIZE - 1) // EQ_LIST_PAGE_SIZE)
+    page = max(1, min(page, max_page))
+    start = (page - 1) * EQ_LIST_PAGE_SIZE
+    page_items = list(enumerate(ids, 1))[start:start + EQ_LIST_PAGE_SIZE]
+
     poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
     lines, number_buttons, row = [], [], []
-    for i, mid in enumerate(ids, 1):
+    for i, mid in page_items:
         status  = poll_status_by_mid.get(mid)
         preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
         mark    = "✅" if mid in selected else "⬜"
@@ -8118,15 +8188,59 @@ def _eqms_keyboard(year, lecture_key, entry, selected: set):
             row = []
     if row:
         number_buttons.append(row)
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"eqmspage:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"eqmspage:{page+1}"))
+    if nav:
+        number_buttons.append(nav)
+
     number_buttons.append([
         InlineKeyboardButton(f"🗑 احذف المختار ({len(selected)})", callback_data="eqmsconfirm"),
         InlineKeyboardButton("❌ إلغاء", callback_data="eqmscancel"),
     ])
+    page_note = f" (صفحة {page}/{max_page})" if max_page > 1 else ""
     text = (
-        f"🗑 <b>{entry['name']}</b> — اختار الأسئلة اللي عايز تحذفها (دوس تحددها، وتاني دوسة تشيلها):\n\n"
+        f"🗑 <b>{entry['name']}</b> — اختار الأسئلة اللي عايز تحذفها (دوس تحددها، وتاني دوسة تشيلها){page_note}:\n\n"
         + "\n\n".join(lines)
     )
     return text, InlineKeyboardMarkup(number_buttons)
+
+async def _eqms_render(query, user_id: int, page: int) -> None:
+    """Shared re-render step for eqmsstart:/eqmspage:/eqmstoggle: — pulls
+    the live lecture for this user's EQMS_SELECTED session, builds the
+    keyboard for `page`, and edits the message.
+
+    Telegram rejects an edit whose text+markup are byte-identical to what's
+    already showing ("message is not modified") — this happens for real
+    here, e.g. select a question then immediately deselect it, landing
+    back on exactly the state eqmsstart: first rendered. Callers all call
+    query.answer() themselves before this runs (clearing the tap's loading
+    spinner immediately, regardless of what happens next), so this can
+    just swallow that one specific error instead of leaving the edit
+    half-done or the spinner stuck."""
+    state = EQMS_SELECTED.get(user_id)
+    if not state:
+        await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
+        return
+    err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
+    if err:
+        EQMS_SELECTED.pop(user_id, None)
+        await query.edit_message_text(err)
+        return
+    if not ids:
+        EQMS_SELECTED.pop(user_id, None)
+        await query.edit_message_text("📭 مفيش أسئلة نحذف منها.")
+        return
+    state["page"] = page
+    text, markup = _eqms_keyboard(state["year"], lecture_key, entry, state["mids"], page=page)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 async def _apply_eqedit(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict, text: str):
     """Applies a typed eqedq:/eqedo:/eqedex: reply to the saved poll
@@ -9433,7 +9547,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── EQLECTURE: list this lecture's questions (first 16 chars each) ──
+    # ── EQLECTURE: list this lecture's questions (paginated — see
+    # _eq_lecture_list_view) ──
     if query.data.startswith("eqlecture:"):
         _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
@@ -9467,35 +9582,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
-        # Text list (first 60 chars of each question, one blank line between
-        # entries) + a numbered grid of buttons below it — callback_data
-        # still carries the question's own immutable channel message_id
-        # (mid), NOT its position in `ids`, since positions shift whenever
-        # an earlier question in this same lecture gets deleted (see
-        # eqq:/eqdel:/eqins: below, which all look the question up by mid
-        # rather than trusting an index).
-        lines = []
-        number_buttons, row = [], []
-        for i, mid in enumerate(ids, 1):
-            status = poll_status_by_mid.get(mid)
-            preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
-            lines.append(f"{i}. {preview}")
-            row.append(InlineKeyboardButton(str(i), callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"))
-            if len(row) == 6:
-                number_buttons.append(row)
-                row = []
-        if row:
-            number_buttons.append(row)
-        number_buttons.append([InlineKeyboardButton(
-            "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
-        )])
-        number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
-        await query.edit_message_text(
-            f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n" + "\n\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(number_buttons),
-        )
+        text, markup = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page=1)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    # ── EQLPAGE: Previous/Next through a long lecture's question list ──
+    # (the eqlecture: screen above, just a different page of it).
+    if query.data.startswith("eqlpage:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, page_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, page = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(page_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        if not ids:
+            await query.edit_message_text(
+                f"✏️ <b>{entry['name']}</b>\n\n📭 مفيش أسئلة في المحاضرة دي.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 رجوع", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")
+                ]]),
+            )
+            return
+        text, markup = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page=page)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
     # ── EQQ: one question picked — show its preview + action buttons ──
@@ -9746,9 +9856,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status)
         return
 
-    # ── EQMSSTART: enter multiselect mode for this lecture's question ──
-    # list (bulk delete instead of one eqdel: tap per question).
+    # ═══════════════════════════════════════════════════════════
+    # BATCH DELETE (EQMS*) — select-multiple-then-delete for one lecture's
+    # question list. Every handler below answers the tap FIRST (clears
+    # Telegram's loading spinner on the button immediately, no matter what
+    # happens next — including the "message is not modified" no-op edit
+    # case _eqms_render swallows), then does its own state change, then
+    # calls _eqms_render to redraw. EQMS_SELECTED[user_id] is the whole
+    # session: {year, mod_idx, subj_idx, lec_idx, lecture_key, mids, page}.
+    # ═══════════════════════════════════════════════════════════
+
+    # ── EQMSSTART: enter multiselect mode for this lecture ─────────────
     if query.data.startswith("eqmsstart:"):
+        await query.answer()
         _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
         err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
@@ -9760,16 +9880,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         EQMS_SELECTED[user_id] = {
             "year": year, "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
-            "lecture_key": lecture_key, "mids": set(),
+            "lecture_key": lecture_key, "mids": set(), "page": 1,
         }
-        text, markup = _eqms_keyboard(year, lecture_key, entry, set())
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await _eqms_render(query, user_id, page=1)
         return
 
-    # ── EQMSTOGGLE: flip one question's selected/not-selected state ───
-    # Only carries the mid — year/mod/subj/lec live in EQMS_SELECTED,
-    # keyed by user_id, same as every other AWAITING_*-style flow here.
+    # ── EQMSPAGE: Previous/Next through a long lecture's selection list ──
+    # (selected mids on other pages stay selected, they just aren't shown).
+    if query.data.startswith("eqmspage:"):
+        await query.answer()
+        if user_id not in EQMS_SELECTED:
+            await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
+            return
+        page = int(query.data.split(":", 1)[1])
+        await _eqms_render(query, user_id, page=page)
+        return
+
+    # ── EQMSTOGGLE: flip one question's selected/not-selected state ────
+    # Only carries the mid — year/mod/subj/lec/page all live in
+    # EQMS_SELECTED, keyed by user_id, same as every other
+    # AWAITING_*-style flow here.
     if query.data.startswith("eqmstoggle:"):
+        await query.answer()
         state = EQMS_SELECTED.get(user_id)
         if not state:
             await query.edit_message_text("⚠️ انتهت جلسة الاختيار دي — ابدأ تاني من قايمة الأسئلة.")
@@ -9779,27 +9911,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["mids"].discard(mid)
         else:
             state["mids"].add(mid)
-        err, entry, lecture_key, ids = _eq_resolve_lecture(state["year"], state["mod_idx"], state["subj_idx"], state["lec_idx"])
-        if err:
-            EQMS_SELECTED.pop(user_id, None)
-            await query.edit_message_text(err)
-            return
-        text, markup = _eqms_keyboard(state["year"], lecture_key, entry, state["mids"])
-        try:
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except BadRequest as e:
-            # Toggling a selection back to a set that matches an already-
-            # rendered state (e.g. select one question then immediately
-            # deselect it) produces byte-identical text+markup — Telegram
-            # rejects that as a no-op edit. The selection itself still
-            # updated correctly above; there's just nothing new to render,
-            # so this is silently ignored rather than surfaced as an error.
-            if "message is not modified" not in str(e).lower():
-                raise
+        await _eqms_render(query, user_id, page=state.get("page", 1))
         return
 
-    # ── EQMSCONFIRM: delete every selected question in one go ─────────
+    # ── EQMSCONFIRM: delete every selected question in one go ──────────
     if query.data == "eqmsconfirm":
+        await query.answer()
         state = EQMS_SELECTED.pop(user_id, None)
         if not state or not state["mids"]:
             await query.edit_message_text("⚠️ مفيش أسئلة متحددة نحذفها.")
@@ -9833,6 +9950,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── EQMSCANCEL: drop the selection, back to the plain question list ──
     if query.data == "eqmscancel":
+        await query.answer()
         state = EQMS_SELECTED.pop(user_id, None)
         if not state:
             await query.edit_message_text("تم الإلغاء.")
