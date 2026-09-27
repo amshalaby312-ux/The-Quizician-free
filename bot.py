@@ -128,11 +128,15 @@ from zoneinfo import ZoneInfo
 #          channel to insert new poll(s) right after it via
 #          QUIZ_INSERT_AFTER, closed the same way as authoring: -END)
 # 5437   START (also wakes bot from sleep; asks for a nickname on first use)
-# 5505   ADMIN HELPERS — is_admin, /dev_panel (Creator-only control panel:
-#          stats snapshot + Set year/Users/Backups/Daily module shortcuts,
-#          replaces the old /admincheck), /set_year (nickname/ID -> year
-#          picker, also reachable from the panel — see
-#          AWAITING_DEVPANEL_SETYEAR/_MYSTATS and _resolve_user_ref)
+# 5505   ADMIN HELPERS — is_admin, admin_bound_year/can_edit_year (each
+#          secondary admin in SECONDARY_ADMIN_YEARS is locked to one year
+#          for /add_lecture, /edit_quiz, /quiz_list, /quiz_delete — see
+#          the SECONDARY_ADMIN_YEARS comment near the top of the file),
+#          /dev_panel (Creator-only control panel: stats snapshot + Set
+#          year/Users/Backups/Daily module shortcuts, replaces the old
+#          /admincheck), /set_year (nickname/ID -> year picker, also
+#          reachable from the panel — see AWAITING_DEVPANEL_SETYEAR/
+#          _MYSTATS and _resolve_user_ref)
 # 5526   BROADCAST COMMAND (admin only)
 # 5603   MAIN — ApplicationBuilder here sets .concurrent_updates(256), so
 #          updates from different users are handled in parallel instead of
@@ -199,17 +203,21 @@ IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_imgs")
 # To find it: message @userinfobot on Telegram → it replies with your ID
 ADMIN_ID = 940770584
 
-# ── Secondary admins — full admin access EXCEPT /dev_panel ───────
-# Replace the placeholders below with real Telegram numeric user IDs
-# (same @userinfobot lookup as ADMIN_ID above). They pass is_admin() —
-# every admin command/callback that gates on is_admin() — but fail
-# is_creator(), which is the one check /dev_panel (and its own
-# callbacks/flows) uses instead. Shows up in /mystats as "Admin" (vs.
-# "The Creator" for ADMIN_ID itself).
-SECONDARY_ADMIN_IDS = {
-    111111111,  # placeholder — replace with a real secondary admin's Telegram ID
-    222222222,  # placeholder — replace with a real secondary admin's Telegram ID
+# ── Secondary admins — full admin access EXCEPT /dev_panel, and each ──
+# one is bound to exactly one year (y1/y2/y3): they can only add/edit/
+# delete quiz content (/add_lecture, /edit_quiz, /quiz_list, /quiz_delete)
+# for THEIR OWN year — see admin_bound_year/can_edit_year below. Replace
+# the placeholders below with real Telegram numeric user IDs (same
+# @userinfobot lookup as ADMIN_ID above), each mapped to the year key
+# they're responsible for. They pass is_admin() — every admin command/
+# callback that gates on is_admin() — but fail is_creator(), which is the
+# one check /dev_panel (and its own callbacks/flows) uses instead. Shows
+# up in /mystats as "Admin" (vs. "The Creator" for ADMIN_ID itself).
+SECONDARY_ADMIN_YEARS = {
+    111111111: "y1",  # placeholder — replace with a real secondary admin's Telegram ID
+    222222222: "y2",  # placeholder — replace with a real secondary admin's Telegram ID
 }
+SECONDARY_ADMIN_IDS = set(SECONDARY_ADMIN_YEARS)   # kept for any plain "is this a secondary admin?" membership check
 
 # ── Replace with your private GROUP's chat ID ────────────────────
 # 1. Create the group, add this bot to it as a member (admin not required
@@ -3422,6 +3430,141 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
         MISTAKES_RETAKE_SESSIONS.pop(user_id, None)
 
 # ═══════════════════════════════════════════════════════════════
+# BOOKMARKS RETAKE — ❤️ Bookmarks menu's "🔁 Retake Questions" button
+# fires off every one of this user's type="bookmarked" entries as a
+# one-shot practice quiz, exactly the same delivery mechanics as the
+# Mistakes Bank retake above (same _deliver_next_daily_question, same
+# session shape). Its own session map/kind ("bmretake") so it can run
+# independently of an in-flight Daily Quiz / Mistakes Bank retake for the
+# same user. Unlike mistakes bank entries, bookmark entries already carry
+# a full question snapshot (see _bookmark_question) — no mid lookup /
+# resolve step needed, they're used as-is.
+# ═══════════════════════════════════════════════════════════════
+BOOKMARKS_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
+
+def _resolved_bookmarks(user_id: int) -> list:
+    """This user's bookmark entries, filtered to ones with enough content
+    to resend as a poll (question + at least 2 options + a valid
+    correct_option_id) — same bar _resolve_mistake enforces for mistakes,
+    just without a lookup since the snapshot is already on the entry."""
+    resolved = []
+    for entry in _bookmark_list(user_id):
+        question = entry.get("question")
+        options  = entry.get("options") or []
+        correct  = entry.get("correct_option_id")
+        if not question or len(options) < 2 or not isinstance(correct, int) or not (0 <= correct < len(options)):
+            continue
+        resolved.append(entry)
+    return resolved
+
+async def start_bookmarks_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
+    """Every question currently in this user's ❤️ Bookmarks, sent one at a
+    time. No once-per-day gate — like the Mistakes Bank retake, this is an
+    on-demand review the user can retake as often as they like."""
+    questions = _resolved_bookmarks(user_id)
+    if not questions:
+        text = "مفيش أسئلة محفوظة لسه! ❤️ اعمل ❤️ على أي سؤال عشان يتضاف هنا."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+        if message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        return
+
+    random.shuffle(questions)
+    session = {
+        "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
+        "current_message_id": None, "total": len(questions), "answered": 0, "correct": 0,
+        "kind": "bmretake",
+    }
+    BOOKMARKS_RETAKE_SESSIONS[user_id] = session
+
+    text = f"❤️ <b>مراجعة Bookmarks</b> — {len(questions)} سؤال، هيتبعتولك واحد واحد 👇"
+    if message:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+
+    sent = await _deliver_next_daily_question(context, user_id, session)
+    if not sent:
+        BOOKMARKS_RETAKE_SESSIONS.pop(user_id, None)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ حصلت مشكلة في تجهيز الأسئلة — جرب تاني.")
+
+async def _advance_bookmarks_retake_session(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict, is_correct: bool, message_id: int | None, delivered_at: float | None = None):
+    """Bookmarks-retake counterpart to _advance_mistakes_retake_session —
+    same XP/streak/achievement bookkeeping, its own completion summary
+    text."""
+    session["answered"] += 1
+    session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
+    if delivered_at is not None:
+        _record_time_spent(user_id, time.time() - delivered_at)
+
+    sent_next = await _deliver_next_daily_question(context, user_id, session)
+    is_last   = not sent_next
+
+    per_question_xp = XP_LECTURE_CORRECT if is_correct else XP_LECTURE_INCORRECT
+    xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
+    session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
+
+    events     = await _record_activity(user_id, persist=False)
+    user_entry = _get_entry(user_id)
+    prev_streak = user_entry.get("lecture_correct_streak_current", 0)
+    user_entry["lecture_questions_answered"]  += 1
+    user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
+    user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
+    if is_correct:
+        user_entry["lecture_correct_streak_current"] += 1
+        if user_entry["lecture_correct_streak_current"] > user_entry["lecture_correct_streak_best"]:
+            user_entry["lecture_correct_streak_best"] = user_entry["lecture_correct_streak_current"]
+    else:
+        user_entry["lecture_correct_streak_current"] = 0
+
+    await _react_to_lecture_answer(
+        context, user_id, message_id,
+        is_correct=is_correct,
+        new_streak=user_entry["lecture_correct_streak_current"],
+        streak_broken=(not is_correct and prev_streak > 0),
+    )
+
+    events["achievements"] += _check_achievements(user_entry, "questions_answered")
+    events["achievements"] += _check_achievements(user_entry, "correct_streak")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+
+    _award_xp(user_entry, xp_delta)
+    final_level = _xp_to_level(user_entry["xp"])
+    if final_level > user_entry["level"]:
+        user_entry["level"] = final_level
+        events["level_up"] = final_level
+    _mark_analytics_dirty()
+    await _announce_events(context, user_id, events)
+    await backup_analytics_to_channel(context)
+
+    if is_last:
+        total     = session["total"]
+        correct   = session["correct"]
+        incorrect = session["answered"] - correct
+        pct       = round(correct / session["answered"] * 100) if session["answered"] else 0
+        summary = (
+            f"❤️ <b>خلصت مراجعة Bookmarks!</b>\n\n"
+            f"✅ صح: {correct}\n"
+            f"❌ غلط: {incorrect}\n"
+            f"📊 نسبة: {pct}%\n"
+            f"📝 عدد الأسئلة: {session['answered']}/{total}\n"
+            f"✨ XP: <b>+{session['xp_earned']}</b>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=summary, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+                ]]),
+            )
+        except Exception:
+            pass
+        BOOKMARKS_RETAKE_SESSIONS.pop(user_id, None)
+
+# ═══════════════════════════════════════════════════════════════
 # PASSWORD-GATED STORAGE (private group)
 # ═══════════════════════════════════════════════════════════════
 # STORAGE_GROUP_ID is the vault: post any photo/video/document/album there
@@ -4322,9 +4465,10 @@ def _sessions_snapshot() -> dict:
             out[str(uid)] = s
         return out
     return {
-        "lecture_sessions":         _clean(LECTURE_SESSIONS),
-        "daily_quiz_sessions":      _clean(DAILY_QUIZ_SESSIONS),
-        "mistakes_retake_sessions": _clean(MISTAKES_RETAKE_SESSIONS),
+        "lecture_sessions":          _clean(LECTURE_SESSIONS),
+        "daily_quiz_sessions":       _clean(DAILY_QUIZ_SESSIONS),
+        "mistakes_retake_sessions":  _clean(MISTAKES_RETAKE_SESSIONS),
+        "bookmarks_retake_sessions": _clean(BOOKMARKS_RETAKE_SESSIONS),
         # Shared per-day Daily Quiz question sets — see the "Per-day,
         # per-year shared Daily Quiz questions" section above for why
         # these ride along in the same snapshot/backup as the sessions.
@@ -4366,8 +4510,8 @@ async def _flush_sessions_if_changed() -> None:
         _last_sessions_snapshot_json = as_json
 
 def _restore_sessions_dict(raw: dict) -> None:
-    """Populates LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
-    in place from a loaded snapshot (channel backup or local file),
+    """Populates LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS/
+    BOOKMARKS_RETAKE_SESSIONS in place from a loaded snapshot (channel backup or local file),
     dropping anything already past SESSIONS_MAX_AGE_SECONDS. Also
     restores the shared per-day Daily Quiz question cache (see the
     "Per-day, per-year shared Daily Quiz questions" section) — loaded
@@ -4376,9 +4520,10 @@ def _restore_sessions_dict(raw: dict) -> None:
     rolled over."""
     global _DAILY_QUIZ_QUESTIONS_DATE, _DAILY_QUIZ_QUESTIONS
     targets = {
-        "lecture_sessions":         LECTURE_SESSIONS,
-        "daily_quiz_sessions":      DAILY_QUIZ_SESSIONS,
-        "mistakes_retake_sessions": MISTAKES_RETAKE_SESSIONS,
+        "lecture_sessions":          LECTURE_SESSIONS,
+        "daily_quiz_sessions":       DAILY_QUIZ_SESSIONS,
+        "mistakes_retake_sessions":  MISTAKES_RETAKE_SESSIONS,
+        "bookmarks_retake_sessions": BOOKMARKS_RETAKE_SESSIONS,
     }
     restored, dropped_stale = 0, 0
     for key, target in targets.items():
@@ -4540,11 +4685,12 @@ async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
 QUESTION_TIMEOUT_GRACE_SECONDS = 2   # buffer past the timer's own open_period, so we're never racing an answer landing right as Telegram auto-closes the poll
 
 _SESSION_STORE_BY_KIND = {
-    "daily":   DAILY_QUIZ_SESSIONS,
-    "retake":  MISTAKES_RETAKE_SESSIONS,
-    "lecture": LECTURE_SESSIONS,
+    "daily":    DAILY_QUIZ_SESSIONS,
+    "retake":   MISTAKES_RETAKE_SESSIONS,
+    "bmretake": BOOKMARKS_RETAKE_SESSIONS,
+    "lecture":  LECTURE_SESSIONS,
 }
-_QUIZ_KIND_LABEL = {"daily": "Daily Quiz", "retake": "Retake", "lecture": "Lecture"}
+_QUIZ_KIND_LABEL = {"daily": "Daily Quiz", "retake": "Retake", "bmretake": "Bookmarks Retake", "lecture": "Lecture"}
 
 def _schedule_question_timeout(context: ContextTypes.DEFAULT_TYPE, kind: str, user_id: int, poll_id: str, timer_seconds: int | None) -> None:
     """Call right after sending a timed poll as part of single-question
@@ -4574,6 +4720,8 @@ async def _advance_session_for_kind(context: ContextTypes.DEFAULT_TYPE, kind: st
         await _advance_daily_quiz_session(context, user_id, session, is_correct, message_id, delivered_at)
     elif kind == "retake":
         await _advance_mistakes_retake_session(context, user_id, session, is_correct, message_id, delivered_at)
+    elif kind == "bmretake":
+        await _advance_bookmarks_retake_session(context, user_id, session, is_correct, message_id, delivered_at)
     elif kind == "lecture":
         await _advance_lecture_session(context, user_id, session, is_correct, message_id, session.get("current_mid"), delivered_at)
 
@@ -5472,6 +5620,14 @@ async def _handle_quiz_poll_timeout(context: ContextTypes.DEFAULT_TYPE, poll) ->
             )
             return
 
+    for user_id, session in list(BOOKMARKS_RETAKE_SESSIONS.items()):
+        if session.get("current_poll_id") == poll_id:
+            await _advance_bookmarks_retake_session(
+                context, user_id, session, False, session.get("current_message_id"),
+                session.get("current_delivered_at"),
+            )
+            return
+
     for user_id, session in list(LECTURE_SESSIONS.items()):
         if session.get("mode") == "batch":
             pending = session.get("pending_polls", {})
@@ -5886,11 +6042,25 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    bm_retake_session = BOOKMARKS_RETAKE_SESSIONS.get(user_id)
+    if bm_retake_session and bm_retake_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, bm_retake_session.get("current_option_count"))
+        if chosen is None:
+            return
+        bm_retake_session["timeout_streak"] = 0
+        is_correct = chosen == bm_retake_session.get("current_correct_id")
+        await _advance_bookmarks_retake_session(
+            context, user_id, bm_retake_session, is_correct, bm_retake_session.get("current_message_id"),
+            bm_retake_session.get("current_delivered_at"),
+        )
+        return
+
     session = LECTURE_SESSIONS.get(user_id)
     if not session:
         # No session at all for this user — most likely the bot restarted
-        # (all of LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
-        # are in-memory only, wiped on restart) while they were mid-quiz.
+        # (all of LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS/
+        # BOOKMARKS_RETAKE_SESSIONS are in-memory only, wiped on restart) while
+        # they were mid-quiz.
         # We can't tell from here which kind of session this poll_id used
         # to belong to, so this is deliberately generic rather than
         # guessing "lecture" when it might have been a Daily Quiz or
@@ -7171,6 +7341,9 @@ async def quiz_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         await update.message.reply_text(err)
         return
+    if not can_edit_year(update, year):
+        await update.message.reply_text(_wrong_year_msg(update))
+        return
     index = QUIZ_INDEX[year]
     if not index:
         await update.message.reply_text(f"📭 مفيش محاضرات مسجلة لسه في {year_label(year)}.")
@@ -7202,6 +7375,9 @@ async def quiz_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     year = context.args[0]
     if not year_channel_id(year):
         await update.message.reply_text(f"⚠️ {year_label(year)} لسه مفيهاش channel_id متظبط.")
+        return
+    if not can_edit_year(update, year):
+        await update.message.reply_text(_wrong_year_msg(update))
         return
     n = int(context.args[1])
     index = QUIZ_INDEX[year]
@@ -7237,6 +7413,9 @@ async def edit_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     years = configured_years()
+    bound = admin_bound_year(update.effective_user.id)
+    if bound:
+        years = [y for y in years if y == bound]
     if not years:
         await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
         return
@@ -7256,6 +7435,9 @@ async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(MSG_ADMIN_ONLY)
         return
     years = configured_years()
+    bound = admin_bound_year(update.effective_user.id)
+    if bound:
+        years = [y for y in years if y == bound]
     if not years:
         await update.message.reply_text("📭 مفيش سنين متاحة دلوقتي.")
         return
@@ -7809,8 +7991,8 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
                 return QUIZZY_MISTAKES_HIGH_MSG
             return None
 
-        # ── starting a lecture quiz / a Mistakes Bank retake at 3–5 AM ──
-        if data.startswith("lecturego:") or data == "mistakes_retake":
+        # ── starting a lecture quiz / a Mistakes Bank or Bookmarks retake at 3–5 AM ──
+        if data.startswith("lecturego:") or data in ("mistakes_retake", "bookmarks_retake"):
             return QUIZZY_LATE_NIGHT_MSG if _quizzy_is_late_night() else None
 
         # ── Settings: the Spaced Repetition / Auto-Next mismatch warnings.
@@ -7927,7 +8109,7 @@ def _eqms_keyboard(year, lecture_key, entry, selected: set):
     lines, number_buttons, row = [], [], []
     for i, mid in enumerate(ids, 1):
         status  = poll_status_by_mid.get(mid)
-        preview = html.escape(status["question"][:24]) if status and status.get("question") else "؟؟؟"
+        preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
         mark    = "✅" if mid in selected else "⬜"
         lines.append(f"{mark} {i}. {preview}")
         row.append(InlineKeyboardButton(f"{mark}{i}", callback_data=f"eqmstoggle:{mid}"))
@@ -7942,7 +8124,7 @@ def _eqms_keyboard(year, lecture_key, entry, selected: set):
     ])
     text = (
         f"🗑 <b>{entry['name']}</b> — اختار الأسئلة اللي عايز تحذفها (دوس تحددها، وتاني دوسة تشيلها):\n\n"
-        + "\n".join(lines)
+        + "\n\n".join(lines)
     )
     return text, InlineKeyboardMarkup(number_buttons)
 
@@ -8042,6 +8224,8 @@ def _bookmarks_text(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMar
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"bookmarks_page:{page+1}"))
     if nav:
         buttons.append(nav)
+    if total:
+        buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="bookmarks_retake")])
     buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     return text, InlineKeyboardMarkup(buttons)
 
@@ -9027,6 +9211,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
             return
+        # Defense in depth on top of the eqyr:/alyr: gate below: every
+        # eq*: callback past the year picker still carries that same year
+        # as its own first argument (the only exceptions — eqmstoggle:/
+        # eqmsconfirm/eqmscancel — never reach here with a year in
+        # parts[1], since they're either mid-only or bare, so this check
+        # simply no-ops for them and they lean on EQMS_SELECTED, itself
+        # only ever populated by an already year-gated eqmsstart:).
+        parts = query.data.split(":")
+        if len(parts) >= 2 and parts[1] in YEARS and not can_edit_year(update, parts[1]):
+            await query.edit_message_text(_wrong_year_msg(update))
+            return
 
     # Every /add_lecture picker callback lives in the "al" namespace —
     # alyr_root/alyr:/almod:/alsubj: — same one-prefix-covers-it-all gate
@@ -9035,9 +9230,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await query.answer("🚫 للأدمن فقط", show_alert=True)
             return
+        parts = query.data.split(":")
+        if len(parts) >= 2 and parts[1] in YEARS and not can_edit_year(update, parts[1]):
+            await query.edit_message_text(_wrong_year_msg(update))
+            return
 
     if query.data == "alyr_root":
         years = configured_years()
+        bound = admin_bound_year(user_id)
+        if bound:
+            years = [y for y in years if y == bound]
         buttons = [[InlineKeyboardButton(year_label(y), callback_data=f"alyr:{y}")] for y in years]
         await query.edit_message_text(
             "📚 <b>Add Lecture — اختار السنة:</b>", parse_mode=ParseMode.HTML,
@@ -9046,6 +9248,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data.startswith("alyr:"):
+        # (year ownership already checked generically above, at the "al"
+        # prefix gate)
         _, year = query.data.split(":")
         modules = ready_modules(year)
         if not modules:
@@ -9140,6 +9344,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "eqyr_root":
         years = configured_years()
+        bound = admin_bound_year(user_id)
+        if bound:
+            years = [y for y in years if y == bound]
         if not years:
             await query.edit_message_text("📭 مفيش سنين متاحة دلوقتي.")
             return
@@ -9155,6 +9362,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if year not in YEARS or not year_channel_id(year):
             await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
             return
+        # (year ownership already checked generically above, at the "eq"
+        # prefix gate)
         modules = ready_modules(year)
         if not modules:
             await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
@@ -9259,17 +9468,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
-        # Text list (first 32 chars of each question) + a numbered grid of
-        # buttons below it — callback_data still carries the question's own
-        # immutable channel message_id (mid), NOT its position in `ids`,
-        # since positions shift whenever an earlier question in this same
-        # lecture gets deleted (see eqq:/eqdel:/eqins: below, which all
-        # look the question up by mid rather than trusting an index).
+        # Text list (first 60 chars of each question, one blank line between
+        # entries) + a numbered grid of buttons below it — callback_data
+        # still carries the question's own immutable channel message_id
+        # (mid), NOT its position in `ids`, since positions shift whenever
+        # an earlier question in this same lecture gets deleted (see
+        # eqq:/eqdel:/eqins: below, which all look the question up by mid
+        # rather than trusting an index).
         lines = []
         number_buttons, row = [], []
         for i, mid in enumerate(ids, 1):
             status = poll_status_by_mid.get(mid)
-            preview = html.escape(status["question"][:32]) if status and status.get("question") else "؟؟؟"
+            preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
             lines.append(f"{i}. {preview}")
             row.append(InlineKeyboardButton(str(i), callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"))
             if len(row) == 6:
@@ -9282,7 +9492,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )])
         number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
         await query.edit_message_text(
-            f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n" + "\n".join(lines),
+            f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n" + "\n\n".join(lines),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(number_buttons),
         )
@@ -9575,7 +9785,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(err)
             return
         text, markup = _eqms_keyboard(state["year"], lecture_key, entry, state["mids"])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest as e:
+            # Toggling a selection back to a set that matches an already-
+            # rendered state (e.g. select one question then immediately
+            # deselect it) produces byte-identical text+markup — Telegram
+            # rejects that as a no-op edit. The selection itself still
+            # updated correctly above; there's just nothing new to render,
+            # so this is silently ignored rather than surfaced as an error.
+            if "message is not modified" not in str(e).lower():
+                raise
         return
 
     # ── EQMSCONFIRM: delete every selected question in one go ─────────
@@ -10113,6 +10333,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "mistakes_retake":
         await start_mistakes_retake(context, user_id, message=query.message)
+        return
+
+    if query.data == "bookmarks_retake":
+        await start_bookmarks_retake(context, user_id, message=query.message)
         return
 
     # ── Admin: /daily_module picker (dqy:/dqm:/dq_scope_off) ─────────
@@ -10857,13 +11081,42 @@ def is_creator(update: Update) -> bool:
     callbacks/flows; every other admin surface uses is_admin()."""
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
+def admin_bound_year(user_id: int) -> str | None:
+    """The single year (y1/y2/y3) a secondary admin is restricted to for
+    quiz-content changes, per SECONDARY_ADMIN_YEARS — or None for the
+    Creator (unrestricted, touches every year) and for anyone who isn't a
+    secondary admin at all."""
+    return SECONDARY_ADMIN_YEARS.get(user_id)
+
+def can_edit_year(update: Update, year: str) -> bool:
+    """True if this admin is allowed to add/edit/delete quiz content for
+    `year`. The Creator can touch every year; a secondary admin can ONLY
+    touch the one year they're bound to in SECONDARY_ADMIN_YEARS — this is
+    the gate /add_lecture, /edit_quiz, /quiz_list, and /quiz_delete (plus
+    their alyr:/eqyr: entry-point callbacks) all check before letting a
+    year selection through."""
+    if not is_admin(update):
+        return False
+    if is_creator(update):
+        return True
+    return admin_bound_year(update.effective_user.id) == year
+
+def _wrong_year_msg(update: Update) -> str:
+    """Denial text for a secondary admin trying to touch quiz content
+    outside their bound year — names the one year they ARE allowed."""
+    bound = admin_bound_year(update.effective_user.id) if update.effective_user else None
+    your_year = year_label(bound) if bound else "؟"
+    return f"🚫 إنت أدمن {your_year} بس — مينفعش تعدل في سنة تانية."
+
 def admin_role_label(user_id: int) -> str:
-    """Role string shown on /mystats: 'The Creator' for ADMIN_ID, 'Admin'
-    for a secondary admin, 'Student' for everyone else."""
+    """Role string shown on /mystats: 'The Creator' for ADMIN_ID, 'Admin
+    (Y1/Y2/Y3)' for a secondary admin (naming the year they're bound to),
+    'Student' for everyone else."""
     if user_id == ADMIN_ID:
         return "The Creator"
-    if user_id in SECONDARY_ADMIN_IDS:
-        return "Admin"
+    bound = admin_bound_year(user_id)
+    if bound:
+        return f"Admin ({year_label(bound)})"
     return "Student"
 
 
