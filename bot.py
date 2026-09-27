@@ -4190,7 +4190,10 @@ AWAITING_EQEDIT = {}    # real_uid -> {"kind": "question"|"options"|"explanation
 # selection just means the admin has to start the selection over.
 EQMS_SELECTED = {}    # real_uid -> {"year","mod_idx","subj_idx","lec_idx","lecture_key","mids": set[int]}
 
-# ── /add_lecture: DM-based authoring (no channel involved) ───────────
+# ── /add_lecture: DM-based authoring (polls captured straight from the
+# forwarded poll's hidden answer, without waiting on a Stop Poll — but
+# see below, an image+poll pair does get an archival copy posted to the
+# year's channel) ──────────────────────────────────────────────────────
 # Armed step by step by alyr:/almod:/alsubj: below. AWAITING_ADD_LECTURE_NAME
 # holds the chosen year/module while waiting for the typed "number: name"
 # reply; once that's parsed, ADD_LECTURE_STATE takes over for the actual
@@ -4198,7 +4201,14 @@ EQMS_SELECTED = {}    # real_uid -> {"year","mod_idx","subj_idx","lec_idx","lect
 # QUIZ_STATE[year]["current_lecture"] so it shares the same single-flight
 # lock the channel-authoring flow already uses — the two can't clash.
 AWAITING_ADD_LECTURE_NAME = {}    # real_uid -> {"year", "module", "subject"}
-ADD_LECTURE_STATE         = {}    # real_uid -> {"year", "lecture_key"}
+ADD_LECTURE_STATE         = {}    # real_uid -> {"year", "lecture_key", ...}
+
+# Minimum character length for a plain-text message sent during an
+# /add_lecture DM session to be treated as a "case study" bound to the
+# next forwarded poll, rather than rejected as a stray/misplaced message —
+# see the case-study branch in handle(). Picked well above any normal typo
+# or one-word reply.
+ADD_LECTURE_CASE_STUDY_MIN_LEN = 40
 
 # ── /broadcast support ────────────────────────────────────────────
 # See the BROADCAST section (grep the banner) further down for the full
@@ -5806,6 +5816,14 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
         pi["mid"]: pi for pi in ((entry.get("poll_images") or []) if entry else [])
     }
 
+    # mid -> case-study text for any poll a /add_lecture DM session bound
+    # one to (see ADD_LECTURE_STATE's "pending_case_study" field and
+    # _capture_add_lecture_poll, which does the binding). Sent as its own
+    # message right before the poll below.
+    poll_case_studies_by_mid = {
+        cs["mid"]: cs["content"] for cs in ((entry.get("poll_case_studies") or []) if entry else [])
+    }
+
     async def _drop_dead(mid: int):
         if entry and mid in entry.get("ids", []):
             entry["ids"].remove(mid)
@@ -5899,6 +5917,16 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
         timer_seconds = get_question_timer_seconds(user_id)
         session["delivered_count"] = session.get("delivered_count", 0) + 1
+
+        case_study = poll_case_studies_by_mid.get(mid)
+        if case_study:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id, text=html.escape(case_study), parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                print(f"Couldn't send case study for lecture question {mid}: {e}")
+
         poll_kwargs = dict(
             chat_id=user_id, question=_numbered_question(question, session["delivered_count"]), options=options,
             type="quiz", correct_option_id=correct_id, is_anonymous=False,
@@ -6507,11 +6535,22 @@ async def _cancel_add_lecture(al_state: dict) -> int:
     removed_count = len(session_ids) + len(session_written_ids)
     if current in QUIZ_INDEX[year]:
         entry = QUIZ_INDEX[year][current]
+        session_id_set = set(session_ids)
         for mid in session_ids:
             if mid in entry["ids"]:
                 entry["ids"].remove(mid)
             for pid in [p for p, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == mid]:
                 QUIZ_POLL_STATUS[year].pop(pid, None)
+        # Drop any image/case-study bound to one of this session's now-
+        # removed polls, so they don't linger as orphaned dead references.
+        if entry.get("poll_images"):
+            entry["poll_images"] = [pi for pi in entry["poll_images"] if pi["mid"] not in session_id_set]
+            if not entry["poll_images"]:
+                entry.pop("poll_images", None)
+        if entry.get("poll_case_studies"):
+            entry["poll_case_studies"] = [cs for cs in entry["poll_case_studies"] if cs["mid"] not in session_id_set]
+            if not entry["poll_case_studies"]:
+                entry.pop("poll_case_studies", None)
         if session_written_ids:
             entry["written"] = [
                 w for w in entry.get("written", [])
@@ -6547,7 +6586,10 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
     message is deleted and resent after each capture, so it always stays
     the newest message in the chat (right under whatever was just
     forwarded) rather than getting buried above later forwards — with
-    End Lecture / Cancel Lecture buttons on it throughout."""
+    End Lecture / Cancel Lecture buttons on it throughout.
+
+    Also claims any pending image / case study staged since the last
+    poll (see ADD_LECTURE_STATE's fields) and binds it to this question."""
     msg     = update.message
     poll    = msg.poll
     year    = al_state["year"]
@@ -6583,6 +6625,61 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
         "explanation":       poll.explanation,
     }
     await save_quiz_poll_status(year)
+
+    # ── Claim any pending image / case study sent since the last poll ──
+    # (see ADD_LECTURE_STATE's "pending_image"/"pending_case_study"
+    # fields, set in handle_image and handle() respectively). A bound
+    # case study is read the same way, as "poll_case_studies", and sent
+    # as its own message right before the poll at delivery time.
+    pending_img  = al_state.pop("pending_image", None)
+    pending_case = al_state.pop("pending_case_study", None)
+
+    # A bound image is first reposted into the year's channel — same
+    # "durably hosted" guarantee the STORAGE_GROUP_ID vault gives the
+    # password-gated media, and the same thing the channel-authoring flow
+    # already gets for free (its images always live in the channel to
+    # begin with). We then store THIS channel copy's file_id, not the
+    # one from the admin's own DM upload, as "poll_images" — the shape
+    # _deliver_next_lecture_question already reads for the
+    # channel-authoring flow, so a bound image is attached as the poll's
+    # native media at delivery time with no extra delivery-side code
+    # needed, and it's backed by a real, permanent channel message the
+    # same way every other poll_images entry in this bot is. If the
+    # channel post fails, we fall back to the admin's own upload rather
+    # than losing the image outright — best-effort, since the question
+    # itself is already safely captured either way.
+    if pending_img:
+        channel_id = year_channel_id(year)
+        stored_img = pending_img
+        if channel_id:
+            try:
+                sent_photo = await context.bot.send_photo(
+                    chat_id=channel_id, photo=pending_img["file_id"],
+                    has_spoiler=pending_img.get("spoiler", False),
+                )
+                channel_photo = sent_photo.photo[-1]
+                stored_img = {
+                    "file_id":        channel_photo.file_id,
+                    "file_unique_id": channel_photo.file_unique_id,
+                    "spoiler":        pending_img.get("spoiler", False),
+                }
+                await context.bot.send_poll(
+                    chat_id=channel_id, question=poll.question,
+                    options=[o.text for o in poll.options], type="quiz",
+                    correct_option_id=poll.correct_option_ids[0],
+                    explanation=poll.explanation, is_anonymous=True,
+                )
+            except Exception as e:
+                print(f"ADD_LECTURE channel backup post failed for lecture '{current}' ({year}): {e}")
+        QUIZ_INDEX[year][current].setdefault("poll_images", []).append({
+            "mid": msg.message_id, **stored_img,
+        })
+        await save_quiz_index(year)
+    if pending_case:
+        QUIZ_INDEX[year][current].setdefault("poll_case_studies", []).append({
+            "mid": msg.message_id, "content": pending_case["content"],
+        })
+        await save_quiz_index(year)
 
     old_status_id = al_state.get("status_message_id")
     if old_status_id:
@@ -6679,6 +6776,32 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         report_caption = (update.message.caption or "").strip()
         await _stage_report_draft(update, context, real_uid, text=report_caption, photo_file_id=report_photo.file_id)
+        return
+
+    # ── /add_lecture DM authoring in progress for this admin: a plain
+    # (not forwarded) photo is a pending image for whichever poll gets
+    # forwarded next — see ADD_LECTURE_STATE's "pending_image" field and
+    # _capture_add_lecture_poll, which claims it. Checked before SLEEPING,
+    # same reasoning as the report-issue branch above: an admin's own
+    # authoring session shouldn't be affected by their SLEEPING flag.
+    al_state = ADD_LECTURE_STATE.get(real_uid)
+    if al_state and is_admin(update):
+        al_photo = update.message.photo[-1] if update.message.photo else None
+        if not al_photo:
+            return
+        replaced_note = (
+            "\n⚠️ ده استبدل الصورة اللي بعتهالك قبل كده — ده كانت لسه معلقة ومربوطتش بسؤال."
+            if al_state.get("pending_image") else ""
+        )
+        al_state["pending_image"] = {
+            "file_id":        al_photo.file_id,
+            "file_unique_id": al_photo.file_unique_id,
+            "spoiler":        bool(getattr(update.message, "has_media_spoiler", False)),
+        }
+        await update.message.reply_text(
+            f"🖼 اتسجلت الصورة — هتترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.{replaced_note}",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if user_id in SLEEPING:
@@ -7490,9 +7613,28 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # ── Case study: a long plain-text message, bound to whichever
+        # poll gets forwarded next (same "last one before the poll wins"
+        # convention as pending_image below, and as QUIZ_PENDING_POLL_IMAGE
+        # in the channel-authoring flow). The length threshold keeps a
+        # short stray message (a typo, "ok", etc.) falling through to the
+        # rejection reply below instead of silently being filed away as a
+        # case study nobody meant to attach.
+        if len(text) >= ADD_LECTURE_CASE_STUDY_MIN_LEN:
+            replaced_note = (
+                "\n⚠️ ده استبدل الـ Case study اللي بعتهولك قبل كده — ده كان لسه معلق ومربوطش بسؤال."
+                if al_state.get("pending_case_study") else ""
+            )
+            al_state["pending_case_study"] = {"content": text}
+            await update.message.reply_text(
+                f"📝 اتسجل الـ Case study — هيترتبط بأول سؤال (Quiz poll) تفورورده دلوقتي.{replaced_note}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         await update.message.reply_text(
-            "📚 لسه في محاضرة مفتوحة للإضافة — فوروارد سؤال (Quiz) أو ابعت سؤال مكتوب وإجابته مخفية بـ Spoiler، "
-            "أو استخدم زراير End/Cancel Lecture تحت آخر رسالة.",
+            "📚 لسه في محاضرة مفتوحة للإضافة — فوروارد سؤال (Quiz)، أو ابعت سؤال مكتوب وإجابته مخفية بـ Spoiler، "
+            "أو ابعت صورة/Case study هيترتبط بالسؤال الجاي، أو استخدم زراير End/Cancel Lecture تحت آخر رسالة.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -7543,6 +7685,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "session_ids": [],            # poll mids added THIS session — what Cancel Lecture undoes
             "session_written_ids": [],    # written-entry message ids added THIS session
             "status_message_id": None,    # the one live running-count message
+            "pending_image": None,        # photo sent (not forwarded) since the last poll — see
+                                           # handle_image's ADD_LECTURE_STATE branch. Claimed (and
+                                           # cleared) by the next forwarded poll; last image before a
+                                           # poll wins, same convention as QUIZ_PENDING_POLL_IMAGE.
+            "pending_case_study": None,   # long text sent since the last poll, to bind to the next
+                                           # forwarded poll — see handle()'s case-study branch below.
+                                           # Same "last one before a poll wins" convention.
         }
 
         resume_note = (
@@ -7553,6 +7702,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆕 <b>[{year_label(year)}] {module} - {subject} Lecture {number}: {name}</b>{resume_note}\n\n"
             "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد، وشيل اسم المرسل من كل واحدة "
             "(Hide Sender's Name) — من غيرها الإجابة الصح مش هتتعرف.\n"
+            "لو عايز تضيف صورة أو Case study (نص) لسؤال معين، ابعتها الأول وبعدين فوروارد السؤال — "
+            "هترتبط بيه تلقائي.\n"
             "بعد أول سؤال هتلاقي رسالة بعداد الأسئلة وزراير End/Cancel Lecture تحتها.",
             parse_mode=ParseMode.HTML,
         )
@@ -8100,42 +8251,42 @@ async def _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, ent
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-EQ_LIST_PAGE_SIZE = 40   # questions per page on the /edit_quiz "اختار رقم السؤال"
-                          # screen (and the batch-delete list below it) — sized
-                          # so pagination only ever kicks in for a genuinely
-                          # long lecture: 40 questions x ~75 chars worst case
-                          # (60-char preview + numbering + blank line) is well
-                          # under Telegram's 4096-char message limit, so a
-                          # normal-sized lecture never shows Previous/Next at
-                          # all — see the "if max_page > 1" guards below. Only
-                          # a lecture that would actually risk "message_too_long"
-                          # gets split into pages.
+EQ_LIST_PAGE_SIZE = 40   # threshold (question count) above which the
+                          # /edit_quiz "اختار رقم السؤال" screen splits into
+                          # two messages instead of one — sized so this only
+                          # kicks in for a genuinely long lecture: 40
+                          # questions x ~75 chars worst case (60-char preview
+                          # + numbering + blank line) is well under
+                          # Telegram's 4096-char message limit, so a
+                          # normal-sized lecture always fits in a single
+                          # message — see the "if total <= EQ_LIST_PAGE_SIZE"
+                          # guard below.
 
-def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page: int = 1):
-    """Builds one page of the /edit_quiz "اختار رقم السؤال اللي عايز تعدله"
-    screen for a lecture — first 60 chars of each question (blank line
-    between), plus a numbered grid of buttons below it, plus Previous/Next
-    nav when there's more than one page. Shared by the eqlecture: entry
-    point (page 1) and the eqlpage: pager below. callback_data on each
-    numbered button still carries the question's own immutable channel
-    message_id (mid), NOT its position in `ids`, since positions shift
-    whenever an earlier question in this same lecture gets deleted (see
-    eqq:/eqdel:/eqins: further down, which all look the question up by mid
-    rather than trusting an index)."""
+def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry):
+    """Builds the /edit_quiz "اختار رقم السؤال اللي عايز تعدله" screen for a
+    lecture — first 60 chars of each question (blank line between), plus a
+    numbered grid of buttons. Returns a list of one or two (text, markup)
+    parts: a short lecture fits in a single message (markup included); a
+    long one is split into two messages instead — the first carries just
+    the first half of the question list as plain text (markup=None), the
+    second carries the second half of the list PLUS the full button grid
+    for every question (both halves) and the action buttons. Callers must
+    send/edit part 1 first, then send part 2 as a follow-up message when
+    it's present. callback_data on each numbered button carries the
+    question's own immutable channel message_id (mid), NOT its position in
+    `ids`, since positions shift whenever an earlier question in this same
+    lecture gets deleted (see eqq:/eqdel:/eqins: further down, which all
+    look the question up by mid rather than trusting an index)."""
     ids = entry["ids"]
     total = len(ids)
-    max_page = max(1, (total + EQ_LIST_PAGE_SIZE - 1) // EQ_LIST_PAGE_SIZE)
-    page = max(1, min(page, max_page))
-    start = (page - 1) * EQ_LIST_PAGE_SIZE
-    page_items = list(enumerate(ids, 1))[start:start + EQ_LIST_PAGE_SIZE]
 
     poll_status_by_mid = {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key}
-    lines = []
+    all_lines = []
     number_buttons, row = [], []
-    for i, mid in page_items:
+    for i, mid in enumerate(ids, 1):
         status = poll_status_by_mid.get(mid)
         preview = html.escape(status["question"][:60]) if status and status.get("question") else "؟؟؟"
-        lines.append(f"{i}. {preview}")
+        all_lines.append(f"{i}. {preview}")
         row.append(InlineKeyboardButton(str(i), callback_data=f"eqq:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"))
         if len(row) == 6:
             number_buttons.append(row)
@@ -8143,25 +8294,23 @@ def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, 
     if row:
         number_buttons.append(row)
 
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"eqlpage:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{page-1}"))
-    if page < max_page:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"eqlpage:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{page+1}"))
-    if nav:
-        number_buttons.append(nav)
-
     number_buttons.append([InlineKeyboardButton(
         "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
     )])
     number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
+    full_markup = InlineKeyboardMarkup(number_buttons)
 
-    page_note = f" (صفحة {page}/{max_page})" if max_page > 1 else ""
-    text = (
-        f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله{page_note}:\n\n"
-        + "\n\n".join(lines)
+    header = f"✏️ <b>{entry['name']}</b> — اختار رقم السؤال اللي عايز تعدله:\n\n"
+    if total <= EQ_LIST_PAGE_SIZE:
+        return [(header + "\n\n".join(all_lines), full_markup)]
+
+    split_at = -(-total // 2)   # ceil(total/2) — divide the list evenly between the two messages
+    part1_text = header + "\n\n".join(all_lines[:split_at])
+    part2_text = (
+        f"✏️ <b>{entry['name']}</b> (تابع):\n\n"
+        + "\n\n".join(all_lines[split_at:])
     )
-    return text, InlineKeyboardMarkup(number_buttons)
+    return [(part1_text, None), (part2_text, full_markup)]
 
 def _eqms_keyboard(year, lecture_key, entry, selected: set, page: int = 1):
     """Renders the eqmsstart:/eqmstoggle: multiselect-delete view: the
@@ -9551,8 +9700,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── EQLECTURE: list this lecture's questions (paginated — see
-    # _eq_lecture_list_view) ──
+    # ── EQLECTURE: list this lecture's questions (split across two
+    # messages for a long lecture — see _eq_lecture_list_view) ──
     if query.data.startswith("eqlecture:"):
         _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
@@ -9586,38 +9735,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        text, markup = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page=1)
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        return
-
-    # ── EQLPAGE: Previous/Next through a long lecture's question list ──
-    # (the eqlecture: screen above, just a different page of it). Answers
-    # the tap first — same reasoning as the EQMS* batch-delete handlers
-    # above: clears the button's loading spinner immediately regardless of
-    # what happens next, including the no-op-edit case caught below.
-    if query.data.startswith("eqlpage:"):
-        await query.answer()
-        _, year, mod_idx_str, subj_idx_str, lec_idx_str, page_str = query.data.split(":")
-        mod_idx, subj_idx, lec_idx, page = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(page_str)
-        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
-        if err:
-            await query.edit_message_text(err)
-            return
-        if not ids:
-            await query.edit_message_text(
-                f"✏️ <b>{entry['name']}</b>\n\n📭 مفيش أسئلة في المحاضرة دي.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 رجوع", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")
-                ]]),
+        parts = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry)
+        first_text, first_markup = parts[0]
+        await query.edit_message_text(first_text, parse_mode=ParseMode.HTML, reply_markup=first_markup)
+        for extra_text, extra_markup in parts[1:]:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id, text=extra_text,
+                parse_mode=ParseMode.HTML, reply_markup=extra_markup,
             )
-            return
-        text, markup = _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry, page=page)
-        try:
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except BadRequest as e:
-            if "message is not modified" not in str(e).lower():
-                raise
         return
 
     # ── EQQ: one question picked — show its preview + action buttons ──
