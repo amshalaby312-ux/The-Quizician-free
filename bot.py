@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 import traceback
 import hashlib
+import secrets
 from io import BytesIO
 from datetime import time as dt_time, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -171,7 +172,7 @@ from zoneinfo import ZoneInfo
 # ═══════════════════════════════════════════════════════════════
 
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile, MessageEntity
 from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
@@ -4220,7 +4221,9 @@ ADD_LECTURE_CASE_STUDY_MIN_LEN = 40
 # message as the broadcast body. Deliberately RAM-only, same as every
 # other AWAITING_*/PENDING_* dict here — a restart mid-compose just
 # means starting the /broadcast draft over, which is harmless.
-BROADCAST_DRAFTS            = {}    # admin_id -> {"audience": "all"|"y1"|"y2"|"y3"|"active"|"inactive", "text": str|None}
+BROADCAST_DRAFTS            = {}    # admin_id -> {"audience": "all"|"y1"|"y2"|"y3"|"active"|"inactive", "text": str|None,
+                                    #   "media": None | {"chat_id","message_id","kind","caption","entities","html"}} — media = an attachment
+                                    #   the admin sent/replied to; broadcast via copy_message (see _deliver_broadcast_item)
 AWAITING_BROADCAST_MESSAGE  = {}    # admin_id -> True, while waiting for the next text message to become the broadcast body
 
 # ── /edit_quiz support ────────────────────────────────────────────
@@ -4236,6 +4239,9 @@ AWAITING_BROADCAST_MESSAGE  = {}    # admin_id -> True, while waiting for the ne
 # insert at the very start of ids[] (not currently reachable from the UI,
 # but supported by the splice logic below for completeness).
 QUIZ_INSERT_AFTER: dict = {y: {} for y in YEARS}
+# NOTE: /edit_quiz's "➕ Insert new poll after" no longer uses this (it
+# opens a DM ADD_LECTURE_STATE session with "insert_after" instead); the
+# channel-side splice still works if something sets it.
 
 # ── Pre-question images for quiz-channel authoring ─────────────────
 # QUIZ_PENDING_POLL_IMAGE[year][lecture_key] = {"file_id", "file_unique_id"}
@@ -5101,52 +5107,64 @@ async def _send_quiz_poll(
 # content, and never on questions authored as native polls in a quiz
 # channel (that pipeline is untouched — see handle_quiz_channel_message).
 #
-# Encodes the 16-bit ASCII pattern for "QZ" (01010001 01011010) one bit
-# per OPTION, in a single running stream that never resets across
-# restarts (persisted to WATERMARK_STATE_FILE): a 1-bit appends a
-# trailing "." to that option's text, a 0-bit leaves it alone. The
-# stream wraps every 16 bits (so every 4 four-option questions is one
-# full "QZ" cycle, but it keeps flowing correctly bit-by-bit even when a
-# question has a different number of options).
+# Encodes the 16-bit ASCII pattern for "QZ" (01010001 01011010) across
+# every FOUR consecutive questions a given creator writes, one nibble
+# per question, one bit per option A-D: a trailing "." on the option =
+# 1, no trailing "." = 0.
+#     Q1 -> 0101   Q2 -> 0001   Q3 -> 0101   Q4 -> 1010   (then repeats)
+# The FIRST question of each 4-question cycle also gets a trailing "."
+# on its stem (a start-of-cycle marker); the other three never do.
 #
-# Whenever the NEXT bit about to be written is bit 0 of a fresh cycle,
-# that question's own stem also gets a trailing "." appended — a marker
-# so anyone decoding a stolen excerpt later can find where a "QZ" cycle
-# starts, even from just a handful of questions rather than the whole
-# bank.
+# Alignment is per QUESTION, not per option, so it can't drift:
+#   • only the first four options carry bits — a 5th option (E) is left
+#     untouched, so 4- and 5-option questions decode identically;
+#   • a question with fewer than 4 options can't carry a nibble, so it
+#     is skipped entirely and does NOT advance the cycle;
+#   • the position counter is kept per creator (their own Telegram id),
+#     so different people's questions never interleave into each
+#     other's sequences; persisted to WATERMARK_STATE_FILE.
+# A natural trailing "." in the original text is normalized (dropped for
+# a 0 bit / kept for a 1 bit) so the pattern always reads back cleanly.
 # ═══════════════════════════════════════════════════════════════
 QZ_WATERMARK_BITS    = "".join(format(ord(c), "08b") for c in "QZ")   # "0101000101011010"
 WATERMARK_STATE_FILE = "watermark_state.json"
 
-_watermark_state      = _load_json_safe(WATERMARK_STATE_FILE, dict, dict, "WATERMARK STATE")
-_WATERMARK_BIT_INDEX  = int(_watermark_state.get("bit_index", 0))
+_watermark_state = _load_json_safe(WATERMARK_STATE_FILE, dict, dict, "WATERMARK STATE")
+if not isinstance(_watermark_state.get("counters"), dict):
+    _watermark_state = {"counters": {}}   # fresh / old single-stream format — start each creator's cycle over
 
 async def _save_watermark_state() -> None:
-    await _write_json_serialized(WATERMARK_STATE_FILE, lambda: {"bit_index": _WATERMARK_BIT_INDEX})
+    await _write_json_serialized(WATERMARK_STATE_FILE, lambda: {"counters": dict(_watermark_state["counters"])})
 
-def _apply_qz_watermark(question: str, raw_options: list) -> tuple[str, list]:
+def _apply_qz_watermark(question: str, raw_options: list, creator_id: int) -> tuple[str, list]:
     """Call exactly once per freshly-CREATED typed-text question, right
     after parsing and before it's delivered/stored. Returns
     (possibly-dotted question, possibly-dotted options) — never mutates
-    the inputs. Advances the module-level bit stream by len(raw_options)
-    bits; caller is responsible for persisting the new position via
+    the inputs. Caller persists the new position via
     _save_watermark_state()."""
-    global _WATERMARK_BIT_INDEX
-    n = len(QZ_WATERMARK_BITS)  # 16
-    watermarked_question = question
-    watermarked_options  = []
-    for opt in raw_options:
-        pos = _WATERMARK_BIT_INDEX % n
-        if pos == 0:
-            # Start of a fresh QZ cycle — mark the question stem.
-            watermarked_question = question.rstrip() + "."
-        bit = QZ_WATERMARK_BITS[pos]
-        opt_text = str(opt).rstrip()
-        if bit == "1":
-            opt_text += "."
-        watermarked_options.append(opt_text)
-        _WATERMARK_BIT_INDEX += 1
-    return watermarked_question, watermarked_options
+    if len(raw_options) < 4:
+        return question, list(raw_options)   # can't carry a nibble — skip, cycle position unchanged
+    counters = _watermark_state["counters"]
+    n      = counters.get(str(creator_id), 0)
+    k      = n % 4                                  # which question of the 4-question cycle this is
+    nibble = QZ_WATERMARK_BITS[4 * k: 4 * k + 4]
+
+    def _norm(text: str, dot: bool) -> str:
+        text = str(text).rstrip()
+        has_dot = text.endswith(".") and not text.endswith("..")
+        if dot and not text.endswith("."):
+            return text + "."
+        if not dot and has_dot:
+            return text[:-1].rstrip()
+        return text
+
+    stem = _norm(question, dot=(k == 0))
+    options = [
+        _norm(opt, dot=(nibble[i] == "1")) if i < 4 else str(opt)
+        for i, opt in enumerate(raw_options)
+    ]
+    counters[str(creator_id)] = n + 1
+    return stem, options
 
 async def deliver_quiz(
     context, chat_id: int, question: str, raw_options: list, correct_index: int,
@@ -6611,7 +6629,16 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    QUIZ_INDEX[year][current]["ids"].append(msg.message_id)
+    ids = QUIZ_INDEX[year][current]["ids"]
+    insert_after = al_state.get("insert_after")
+    if insert_after is not None and insert_after in ids:
+        # Opened from /edit_quiz's "➕ Insert new poll after" — splice in
+        # right after that question, then advance the marker so the next
+        # forwarded poll lands after THIS one, keeping send order.
+        ids.insert(ids.index(insert_after) + 1, msg.message_id)
+        al_state["insert_after"] = msg.message_id
+    else:
+        ids.append(msg.message_id)
     al_state.setdefault("session_ids", []).append(msg.message_id)
     await save_quiz_index(year)
 
@@ -6824,7 +6851,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_mcq_block(caption) if caption else None
     if parsed:
         question, raw_options, correct_index, explanation = parsed
-        question, raw_options = _apply_qz_watermark(question, raw_options)
+        question, raw_options = _apply_qz_watermark(question, raw_options, real_uid)
         await _save_watermark_state()
         await deliver_quiz(
             context, user_id, question, raw_options, correct_index,
@@ -6876,7 +6903,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         question, raw_options, correct_index, explanation = parsed
-        question, raw_options = _apply_qz_watermark(question, raw_options)
+        question, raw_options = _apply_qz_watermark(question, raw_options, real_uid)
         await _save_watermark_state()
         await deliver_quiz(context, user_id, question, raw_options, correct_index, explanation=explanation)
         events = await _record_activity(real_uid, questions_delta=1)
@@ -7771,6 +7798,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         draft = BROADCAST_DRAFTS.setdefault(real_uid, {"audience": "all", "text": None})
         draft["text"] = text
+        draft["media"] = None   # a typed message replaces any attachment set earlier
         body, markup = _broadcast_composer_view(real_uid)
         await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
@@ -8023,7 +8051,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # before this message is paired with this question.
             pending_img = PENDING_IMAGE.pop(user_id, None)
 
-            question, raw_options = _apply_qz_watermark(question, raw_options)
+            question, raw_options = _apply_qz_watermark(question, raw_options, real_uid)
             await _save_watermark_state()
 
             await deliver_quiz(
@@ -8294,9 +8322,28 @@ def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry):
     if row:
         number_buttons.append(row)
 
-    number_buttons.append([InlineKeyboardButton(
-        "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
-    )])
+    # Written (unscored) entries — kept in entry["written"], separate from
+    # the polls in ids — listed after the polls as W1, W2, ... Tapping one
+    # opens its own preview with a delete button (eqw:/eqwdel: below).
+    w_row = []
+    for j, w in enumerate(entry.get("written") or [], 1):
+        wid = w.get("id")
+        label = html.escape(str(w.get("title") or w.get("content") or "؟؟؟")[:60])
+        all_lines.append(f"📝 W{j}. {label}")
+        if wid is None:
+            continue
+        w_row.append(InlineKeyboardButton(f"📝W{j}", callback_data=f"eqw:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{wid}"))
+        if len(w_row) == 4:
+            number_buttons.append(w_row)
+            w_row = []
+    if w_row:
+        number_buttons.append(w_row)
+    total = len(all_lines)   # polls + written, for the split-in-two threshold below
+
+    if ids:
+        number_buttons.append([InlineKeyboardButton(
+            "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+        )])
     number_buttons.append([InlineKeyboardButton("🔙 رجوع للمحاضرات", callback_data=f"eqsubject:{year}:{mod_idx}:{subj_idx}")])
     full_markup = InlineKeyboardMarkup(number_buttons)
 
@@ -8504,26 +8551,121 @@ async def _send_bookmarks(context: ContextTypes.DEFAULT_TYPE, user_id: int, repl
 # ── Lecture quick-access links — /start deep link straight to a
 # lecture's preview screen (▶️ Start / ❌ Cancel), skipping the normal
 # Year -> Module -> Subject -> Lecture browse. Telegram deep-link
-# payloads only allow [A-Za-z0-9_-], so the payload is just the same
-# year/mod_idx/subj_idx/lec_idx the lecture:/lecturego: callbacks
-# already use, joined with "_" (year itself, e.g. "y1", never contains
-# one). Handed out via the 🔗 button on the lecture preview screen
-# (see the "lecturelink:" branch in button_handler) and consumed in
-# start().
-def _build_lecture_quicklink_payload(year: str, mod_idx: int, subj_idx: int, lec_idx: int) -> str:
-    return f"lec_{year}_{mod_idx}_{subj_idx}_{lec_idx}"
+# payloads only allow [A-Za-z0-9_-].
+#
+# PERMANENT links: every lecture entry carries its own random "uid"
+# (QUIZ_INDEX[year][lecture_key]["uid"], 8 hex chars, assigned once and
+# never changed — it lives inside the entry, so it's saved/backed up/
+# restored with the rest of the quiz index and survives renumbering,
+# deleting other lectures, etc.). Payload format: "L_<year>_<uid>".
+#
+# LEGACY links (the first version of this feature) used positions
+# instead: "lec_<year>_<mod_idx>_<subj_idx>_<lec_idx>". Those keep
+# working: at startup _freeze_legacy_lecture_links records, once per
+# year, which lecture each position pointed to at that moment
+# (QUIZ_STATE[year]["legacy_links"], backed up with the quiz state) and
+# from then on legacy payloads resolve through that frozen table
+# instead of live positions — so they stop drifting too.
+def _lecture_uid(year: str, lecture_key: str) -> tuple[str, bool]:
+    """Returns (uid, newly_assigned) for one lecture, assigning a fresh
+    unique uid the first time. The caller must save (and back up) the
+    quiz index if newly_assigned is True."""
+    entry = QUIZ_INDEX[year][lecture_key]
+    uid = entry.get("uid")
+    if isinstance(uid, str) and uid:
+        return uid, False
+    taken = {e.get("uid") for e in QUIZ_INDEX[year].values()}
+    while True:
+        uid = secrets.token_hex(4)
+        if uid not in taken:
+            break
+    entry["uid"] = uid
+    return uid, True
 
-def _parse_lecture_quicklink_payload(payload: str) -> tuple[str, int, int, int] | None:
-    """Returns (year, mod_idx, subj_idx, lec_idx) or None if `payload`
-    isn't a well-formed lecture quick-link (e.g. some other /start
-    param, or a garbled/hand-edited one)."""
-    parts = payload.split("_")
-    if len(parts) != 5 or parts[0] != "lec":
+def _build_lecture_quicklink_payload(year: str, uid: str) -> str:
+    return f"L_{year}_{uid}"
+
+def _parse_lecture_quicklink_payload(payload: str):
+    """Returns ("uid", year, uid) for a permanent link, ("idx", year,
+    (mod_idx, subj_idx, lec_idx)) for a legacy positional link, or None
+    if `payload` isn't a well-formed lecture quick-link at all (some
+    other /start param, or garbled/hand-edited)."""
+    parts = (payload or "").split("_")
+    if len(parts) == 3 and parts[0] == "L" and parts[2].isalnum():
+        return "uid", parts[1], parts[2]
+    if len(parts) == 5 and parts[0] == "lec" and all(x.isdigit() for x in parts[2:]):
+        return "idx", parts[1], (int(parts[2]), int(parts[3]), int(parts[4]))
+    return None
+
+def _locate_lecture_by_uid(year: str, uid: str):
+    """(mod_idx, subj_idx, lec_idx) of the lecture with this uid RIGHT
+    NOW (the lecture:/lecturego: buttons still use positions, but those
+    are freshly computed per screen), or None if it no longer exists /
+    isn't ready."""
+    for key, entry in QUIZ_INDEX.get(year, {}).items():
+        if entry.get("uid") != uid:
+            continue
+        module, subject = entry.get("module"), entry.get("subject")
+        modules = ready_modules(year)
+        if module not in modules:
+            return None
+        subjects = ready_subjects(year, module)
+        if subject not in subjects:
+            return None
+        keys = ready_lecture_keys(year, module, subject)
+        if key not in keys:
+            return None
+        return modules.index(module), subjects.index(subject), keys.index(key)
+    return None
+
+def _lecture_quicklink_preview(payload: str, user_id: int):
+    """None if `payload` isn't a lecture quick-link; otherwise the
+    (text, markup) to show — the lecture's preview screen, or a "no
+    longer exists" message if it was deleted."""
+    parsed = _parse_lecture_quicklink_payload(payload)
+    if parsed is None:
         return None
-    _, year, mod_idx_str, subj_idx_str, lec_idx_str = parts
-    if not (mod_idx_str.isdigit() and subj_idx_str.isdigit() and lec_idx_str.isdigit()):
-        return None
-    return year, int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+    kind, year, ref = parsed
+    if kind == "uid":
+        loc = _locate_lecture_by_uid(year, ref)
+    else:
+        frozen = QUIZ_STATE.get(year, {}).get("legacy_links")
+        if isinstance(frozen, dict):
+            uid = frozen.get("_".join(str(i) for i in ref))
+            loc = _locate_lecture_by_uid(year, uid) if uid else None
+        else:
+            loc = ref   # not frozen yet (startup freeze skipped) — live positions, as before
+    if loc is None:
+        return "⚠️ المحاضرة دي مش موجودة دلوقتي.", None
+    return _lecture_preview_view(year, *loc, user_id)
+
+async def _freeze_legacy_lecture_links(app) -> None:
+    """Startup, after the quiz restores: (1) give every ready lecture a
+    uid, (2) once per year, freeze the position -> uid table that
+    legacy "lec_<year>_<m>_<s>_<l>" links resolve through. Saves and
+    backs up whatever changed. Skips a year whose restore failed (its
+    index may be stale/empty)."""
+    ctx = SimpleNamespace(bot=app.bot)
+    for year in configured_years():
+        if not RESTORE_OK.get(f"quiz_{year}", True):
+            continue
+        state = QUIZ_STATE[year]
+        legacy = {} if not isinstance(state.get("legacy_links"), dict) else None
+        changed = False
+        for mod_idx, module in enumerate(ready_modules(year)):
+            for subj_idx, subject in enumerate(ready_subjects(year, module)):
+                for lec_idx, key in enumerate(ready_lecture_keys(year, module, subject)):
+                    uid, new = _lecture_uid(year, key)
+                    changed = changed or new
+                    if legacy is not None:
+                        legacy[f"{mod_idx}_{subj_idx}_{lec_idx}"] = uid
+        if legacy is not None:
+            state["legacy_links"] = legacy
+            changed = True
+        if changed:
+            await save_quiz_index(year)
+            await save_quiz_state(year)
+            await backup_quiz_to_channel(ctx, year)
 
 def _lecture_preview_view(
     year: str, mod_idx: int, subj_idx: int, lec_idx: int, user_id: int,
@@ -8646,8 +8788,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.data == "bcmsg":
             AWAITING_BROADCAST_MESSAGE[user_id] = True
             await query.edit_message_text(
-                "✏️ ابعت نص الرسالة اللي عايز تبثها دلوقتي.\n"
-                "HTML بسيط متاح: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;code&gt;</code>...",
+                "✏️ ابعت نص الرسالة اللي عايز تبثها دلوقتي — أو أي مرفق (صورة/فيديو/ملف/صوت/ستيكر...) وهيتبعت زي ما هو.\n"
+                "HTML بسيط متاح للنص: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;code&gt;</code>...",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bcmsgcancel")]]),
             )
@@ -8662,11 +8804,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.data == "bcpreview":
             draft = BROADCAST_DRAFTS.get(user_id)
             text  = draft.get("text") if draft else None
-            if not text:
+            media = draft.get("media") if draft else None
+            if not (text or media):
                 await query.answer("⚠️ لسه مفيش رسالة.", show_alert=True)
                 return
             try:
-                await context.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
+                await _deliver_broadcast_item(context.bot, user_id, text, media)
             except Exception as e:
                 await query.answer(f"⚠️ مشكلة في الرسالة (يمكن الـ HTML مش مظبوط): {e}", show_alert=True)
             return
@@ -8680,7 +8823,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.data == "bcsend":
             draft = BROADCAST_DRAFTS.get(user_id)
             text  = draft.get("text") if draft else None
-            if not text:
+            media = draft.get("media") if draft else None
+            if not (text or media):
                 await query.answer("⚠️ لسه مفيش رسالة.", show_alert=True)
                 return
             audience   = draft["audience"]
@@ -8691,7 +8835,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             BROADCAST_DRAFTS.pop(user_id, None)
             AWAITING_BROADCAST_MESSAGE.pop(user_id, None)
             await query.edit_message_text("📡 بيتجهز للإرسال…")
-            await _send_broadcast(context, query.message, audience, text, recipients)
+            await _send_broadcast(context, query.message, audience, text, recipients, media)
             return
 
 
@@ -9279,9 +9423,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         subject = subjects[subj_idx]
         names = ready_lecture_keys(year, module, subject)
+        # ✅ marks a lecture this user has finished — a recorded result
+        # exists only once a real (non-retake) run reaches the end, see
+        # _finish_lecture_session. .get, not _get_lecture_results, so
+        # merely browsing never creates empty result buckets.
+        def _done_mark(name: str) -> str:
+            return "✅ " if str(user_id) in LECTURE_RESULTS.get(_lr_key(year, name), {}) else ""
         buttons = [
             [InlineKeyboardButton(
-                f"Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}",
+                f"{_done_mark(name)}Lecture {QUIZ_INDEX[year][name]['lecture_number'] or (i + 1)}: {QUIZ_INDEX[year][name]['name']}",
                 callback_data=f"lecture:{year}:{mod_idx}:{subj_idx}:{i}",
             )]
             for i, name in enumerate(names)
@@ -9311,15 +9461,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("lecturelink:"):
         _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
         await query.answer()
+        try:
+            module = ready_modules(year)[int(mod_idx_str)]
+            subject = ready_subjects(year, module)[int(subj_idx_str)]
+            lecture_key = ready_lecture_keys(year, module, subject)[int(lec_idx_str)]
+        except (KeyError, IndexError, ValueError):
+            await context.bot.send_message(chat_id=user_id, text="⚠️ المحاضرة دي مش موجودة دلوقتي.")
+            return
+        uid, is_new = _lecture_uid(year, lecture_key)
+        if is_new:
+            await save_quiz_index(year)
+            await backup_quiz_to_channel(context, year)   # so a restore can't hand out a different uid later
         me = await context.bot.get_me()
-        payload = _build_lecture_quicklink_payload(year, int(mod_idx_str), int(subj_idx_str), int(lec_idx_str))
-        link = f"https://t.me/{me.username}?start={payload}"
+        link = f"https://t.me/{me.username}?start={_build_lecture_quicklink_payload(year, uid)}"
         await context.bot.send_message(
             chat_id=user_id,
             text=(
                 "🔗 <b>لينك سريع للمحاضرة دي:</b>\n"
                 f"{link}\n\n"
-                "أي حد يدوس عليه هيوديه على طول للمحاضرة، وهيلاقي زرار ▶️ ابدأ و❌ إلغاء."
+                "أي حد يدوس عليه هيوديه على طول للمحاضرة، وهيلاقي زرار ▶️ ابدأ و❌ إلغاء. "
+                "اللينك ده دايم — مش هيتغير لو اتمسحت أو اتضافت محاضرات تانية."
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -9725,7 +9886,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lecture_key = names[lec_idx]
         entry = QUIZ_INDEX[year][lecture_key]
         ids = entry["ids"]
-        if not ids:
+        if not ids and not entry.get("written"):
             await query.edit_message_text(
                 f"✏️ <b>{entry['name']}</b>\n\n📭 مفيش أسئلة في المحاضرة دي.",
                 parse_mode=ParseMode.HTML,
@@ -9837,55 +9998,110 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── EQINS: reopen this lecture in the quiz channel so the admin can ──
-    # post new poll(s) right after this question, then -END as usual.
+    # ── EQW: one written (unscored) entry picked — preview + delete ──
+    # Identified by the entry's own "id" (its source message_id), never by
+    # position, same reasoning as eqq: for polls.
+    if query.data.startswith("eqw:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, wid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        w = next((x for x in (entry.get("written") or []) if str(x.get("id")) == wid_str), None)
+        if not w:
+            await query.edit_message_text("⚠️ الجزء المكتوب ده مش موجود دلوقتي — يمكن اتشال من حتة تانية.")
+            return
+        title   = html.escape(str(w.get("title") or "(من غير عنوان)"))
+        content = str(w.get("content") or "")
+        snippet = html.escape(content[:700]) + ("…" if len(content) > 700 else "")
+        buttons = [
+            [InlineKeyboardButton("🗑 Delete this entry", callback_data=f"eqwdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{wid_str}")],
+            [InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
+        ]
+        await query.edit_message_text(
+            f"📝 <b>{entry['name']}</b> — سؤال/جزء مكتوب\n\n<b>{title}</b>\n\n{snippet}\n\nاختار الإجراء:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── EQWDEL: remove this written entry from the lecture ────────────
+    if query.data.startswith("eqwdel:"):
+        _, year, mod_idx_str, subj_idx_str, lec_idx_str, wid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
+            return
+        before = entry.get("written") or []
+        after  = [x for x in before if str(x.get("id")) != wid_str]
+        if len(after) == len(before):
+            await query.edit_message_text("⚠️ الجزء المكتوب ده مش موجود دلوقتي — يمكن اتشال من حتة تانية.")
+            return
+        if after:
+            entry["written"] = after
+        else:
+            entry.pop("written", None)
+        await save_quiz_index(year)
+        await backup_quiz_to_channel(context, year)
+        await query.edit_message_text(
+            f"🗑 <b>اتشال الجزء المكتوب من {entry['name']}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+            )]]),
+        )
+        return
+
+    # ── EQINS: reopen this lecture as a DM authoring session (same ──────
+    # machinery as /add_lecture — ADD_LECTURE_STATE, forwarded polls,
+    # images, case studies, spoiler written questions, End/Cancel buttons)
+    # with the new polls spliced in right after the chosen question
+    # instead of appended at the end (al_state["insert_after"], advanced
+    # to each newly inserted mid — see _capture_add_lecture_poll).
     if query.data.startswith("eqins:"):
         _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
         mod_idx, subj_idx, lec_idx, target_mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
-        if year not in YEARS or not year_channel_id(year):
-            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+        err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+        if err:
+            await query.edit_message_text(err)
             return
-        modules = ready_modules(year)
-        if mod_idx >= len(modules):
-            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
-            return
-        module = modules[mod_idx]
-        subjects = ready_subjects(year, module)
-        if subj_idx >= len(subjects):
-            await query.edit_message_text("⚠️ المادة دي مش موجودة دلوقتي.")
-            return
-        subject = subjects[subj_idx]
-        names = ready_lecture_keys(year, module, subject)
-        if lec_idx >= len(names):
-            await query.edit_message_text("⚠️ المحاضرة دي مش موجودة دلوقتي.")
-            return
-        lecture_key = names[lec_idx]
-        entry = QUIZ_INDEX[year][lecture_key]
-        ids = entry["ids"]
         if target_mid not in ids:
             await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
             return
-
+        if ADD_LECTURE_STATE.get(user_id):
+            await query.edit_message_text("⚠️ عندك محاضرة مفتوحة للإضافة بالفعل — اقفلها (End) أو الغيها (Cancel) الأول.")
+            return
         other_current = QUIZ_STATE[year].get("current_lecture")
-        if other_current and other_current != lecture_key:
+        if other_current and other_current in QUIZ_INDEX[year] and not QUIZ_INDEX[year][other_current]["closed"]:
             await query.edit_message_text(
-                f"⚠️ فيه محاضرة تانية مفتوحة دلوقتي في القناة (<b>{other_current}</b>) — "
-                "لازم تقفلها بـ -END الأول قبل ما تضيف سؤال هنا.",
+                f"⚠️ في محاضرة مفتوحة دلوقتي (<b>{other_current}</b>) — لازم تتقفل بـ -END الأول.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
+        was_closed_before = entry.get("closed", True)
         entry["closed"] = False
         await save_quiz_index(year)
         QUIZ_STATE[year]["current_lecture"] = lecture_key
         await save_quiz_state(year)
-        QUIZ_INSERT_AFTER[year][lecture_key] = target_mid
-
+        ADD_LECTURE_STATE[user_id] = {
+            "year": year, "lecture_key": lecture_key,
+            "existed_before": True, "was_closed_before": was_closed_before,
+            "session_ids": [], "session_written_ids": [],
+            "status_message_id": None, "pending_image": None, "pending_case_study": None,
+            "insert_after": target_mid,   # new polls splice in after this mid, one after another
+        }
         await query.edit_message_text(
-            f"➕ <b>{entry['name']}</b> اتفتحت تاني للإضافة.\n\n"
-            "دلوقتي ابعت السؤال (أو الأسئلة) الجديدة في القناة — هتتحط بعد السؤال اللي اخترته على طول.\n"
-            "لما تخلص، ابعت <code>-END</code> في القناة زي المعتاد.",
+            f"➕ <b>{entry['name']}</b> اتفتحت للإضافة.\n\n"
+            "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد، وشيل اسم المرسل من كل واحدة "
+            "(Hide Sender's Name) — هتتحط بعد السؤال اللي اخترته على طول، بالترتيب اللي هتبعتهم بيه.\n"
+            "لو عايز تضيف صورة أو Case study (نص) لسؤال معين، ابعتها الأول وبعدين فوروارد السؤال. "
+            "وتقدر تبعت سؤال مكتوب وإجابته مخفية بـ Spoiler زي /add_lecture بالظبط.\n"
+            "لما تخلص دوس End Lecture (أو ابعت <code>-END</code>).",
             parse_mode=ParseMode.HTML,
+            reply_markup=_add_lecture_status_markup(),
         )
         return
 
@@ -10371,10 +10587,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # in PENDING_LECTURE_LINK by start()), drop them into that
         # lecture's preview screen instead of the normal welcome menu.
         pending_payload = PENDING_LECTURE_LINK.pop(user_id, None)
-        parsed = _parse_lecture_quicklink_payload(pending_payload) if pending_payload else None
-        if parsed:
-            year, mod_idx, subj_idx, lec_idx = parsed
-            text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, user_id)
+        preview = _lecture_quicklink_preview(pending_payload, user_id) if pending_payload else None
+        if preview:
+            text, markup = preview
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
 
@@ -11041,7 +11256,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nickname = get_nickname(real_uid)
 
     # ── Quick-access lecture link — /start payload from a shared
-    # https://t.me/<bot>?start=lec_... link (see _build_lecture_quicklink_payload
+    # https://t.me/<bot>?start=L_... link (see _build_lecture_quicklink_payload
     # / the 🔗 button on the lecture preview screen). Stashed here as soon
     # as it arrives, BEFORE the onboarding gates below, so someone who
     # taps a lecture link before ever finishing onboarding doesn't lose
@@ -11088,10 +11303,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # onboard_go, which a fully-onboarded user never taps.
     pending_payload = PENDING_LECTURE_LINK.pop(real_uid, None)
     if pending_payload:
-        parsed = _parse_lecture_quicklink_payload(pending_payload)
-        if parsed:
-            year, mod_idx, subj_idx, lec_idx = parsed
-            text, markup = _lecture_preview_view(year, mod_idx, subj_idx, lec_idx, real_uid)
+        preview = _lecture_quicklink_preview(pending_payload, real_uid)
+        if preview:
+            text, markup = preview
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
 
@@ -11305,7 +11519,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("/previewtxt — text dump of every static message a normal user can see")
         lines.append("/health")
         lines.append("/restore")
-        lines.append("/broadcast &lt;message&gt;")
+        lines.append("/broadcast &lt;message&gt;  (or attach a file/photo/video with /broadcast as its caption)")
         lines.append("/ban &lt;ID&gt; &lt;hours&gt; &lt;reason&gt;")
         lines.append("/unban &lt;ID&gt;")
         lines.append("/backup_now")
@@ -11733,6 +11947,7 @@ def _broadcast_composer_view(admin_id: int) -> tuple:
     draft    = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
     audience = draft["audience"]
     text     = draft["text"]
+    media    = draft.get("media")
     count    = len(_broadcast_audience_user_ids(audience))
 
     lines = ["📡 <b>BROADCAST</b>", "", "👥 <b>Audience</b>"]
@@ -11742,10 +11957,12 @@ def _broadcast_composer_view(admin_id: int) -> tuple:
         lines.append(f"{branch} {mark}{BROADCAST_AUDIENCE_LABELS[key]}")
     lines.append("")
     lines.append("📝 <b>Message</b>")
+    if media:
+        lines.append(f"📎 <b>Attachment:</b> {media['kind']}")
     if text:
         preview = html.escape(text[:200]) + ("…" if len(text) > 200 else "")
         lines.append(preview)
-    else:
+    elif not media:
         lines.append("<i>⚠️ لسه مفيش رسالة — دوس ✏️ Set Message تحت</i>")
     lines.append("")
     lines.append(f"📊 <b>Estimated:</b> {count:,} recipient(s)")
@@ -11761,12 +11978,12 @@ def _broadcast_composer_view(admin_id: int) -> tuple:
         buttons.append(row)
 
     msg_row = [InlineKeyboardButton("✏️ Set Message", callback_data="bcmsg")]
-    if text:
+    if text or media:
         msg_row.append(InlineKeyboardButton("👁 Preview", callback_data="bcpreview"))
     buttons.append(msg_row)
 
     action_row = []
-    if text and count:   # SEND only offered once there's actually something, to someone, to send
+    if (text or media) and count:   # SEND only offered once there's actually something, to someone, to send
         action_row.append(InlineKeyboardButton("🚀 SEND", callback_data="bcsend"))
     action_row.append(InlineKeyboardButton("❌ CANCEL", callback_data="bccancel"))
     buttons.append(action_row)
@@ -11783,21 +12000,119 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # message with /broadcast — pre-fills the composer's message so the
     # admin doesn't have to retype it via ✏️ Set Message. Audience stays
     # whatever it was last set to (defaulting to "all" the first time).
-    prefilled = None
-    if context.args:
-        prefilled = " ".join(context.args)
-    elif update.message.reply_to_message and update.message.reply_to_message.text:
-        prefilled = update.message.reply_to_message.text
+    # Replying to a message that carries an ATTACHMENT (photo, video,
+    # file, audio, voice, GIF, video note, sticker) pre-fills that
+    # attachment too; any text typed after /broadcast then replaces its
+    # caption. (An attachment sent WITH a "/broadcast ..." caption goes
+    # through broadcast_media_cmd instead — CommandHandler never sees
+    # captions.)
+    reply     = update.message.reply_to_message
+    reply_kind = _broadcast_media_kind(reply) if reply else None
+    args_text = " ".join(context.args) if context.args else None
 
     draft = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
-    if prefilled:
-        draft["text"] = prefilled
+    if reply_kind:
+        media = {
+            "chat_id": reply.chat_id, "message_id": reply.message_id, "kind": reply_kind,
+            "caption": args_text, "entities": None, "html": True,   # caption=None keeps the original caption as-is
+        }
+        draft["media"] = media
+        draft["text"]  = args_text if args_text is not None else (reply.caption or "")
+    elif args_text:
+        draft["text"], draft["media"] = args_text, None
+    elif reply and reply.text:
+        draft["text"], draft["media"] = reply.text, None
     AWAITING_BROADCAST_MESSAGE.pop(admin_id, None)
 
     body, markup = _broadcast_composer_view(admin_id)
     await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
 
-async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str, recipients: list) -> None:
+# ── Broadcast attachments ─────────────────────────────────────────
+BROADCAST_CAPTIONABLE_KINDS = {"photo", "video", "document", "audio", "voice", "animation"}   # kinds copy_message accepts a caption override for
+_BROADCAST_CMD_CAPTION_RE   = re.compile(r"^/broadcast(?:@\w+)?(?:\s+|$)")
+
+def _broadcast_media_kind(msg) -> str | None:
+    """The attachment type on `msg` ("photo", "video", ...) or None if
+    it carries none (plain text, poll, location, ...)."""
+    if msg is None:
+        return None
+    for kind in ("photo", "video", "document", "audio", "voice", "animation", "video_note", "sticker"):
+        if getattr(msg, kind, None):
+            return kind
+    return None
+
+class _BroadcastAttachmentFilter(filters.MessageFilter):
+    """Matches an admin's private-chat attachment that is meant for the
+    broadcast composer: either it's captioned "/broadcast ..." or the
+    composer is currently waiting for its message (✏️ Set Message).
+    Everything else falls through to the normal handlers untouched."""
+    def filter(self, message) -> bool:
+        user = message.from_user
+        if message.chat.type != "private" or not user:
+            return False
+        if user.id != ADMIN_ID and user.id not in SECONDARY_ADMIN_IDS:
+            return False
+        if _broadcast_media_kind(message) is None:
+            return False
+        return bool(AWAITING_BROADCAST_MESSAGE.get(user.id)) or bool(
+            _BROADCAST_CMD_CAPTION_RE.match(message.caption or "")
+        )
+
+async def broadcast_media_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """An attachment sent (a) with a "/broadcast <caption>" caption, or
+    (b) while the composer is waiting on its message: it becomes the
+    broadcast body, delivered to everyone via copy_message so every
+    attachment type (and its formatting) goes through as-is."""
+    msg      = update.message
+    admin_id = update.effective_user.id
+    kind     = _broadcast_media_kind(msg)
+    draft    = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
+    AWAITING_BROADCAST_MESSAGE.pop(admin_id, None)
+
+    caption = msg.caption or ""
+    m = _BROADCAST_CMD_CAPTION_RE.match(caption)
+    if m:
+        # Strip the "/broadcast " prefix from the caption and shift the
+        # formatting entities left to match (drops the /command entity).
+        cut       = m.end()
+        stripped  = caption[cut:]
+        entities  = [
+            MessageEntity(
+                type=e.type, offset=e.offset - cut, length=e.length, url=e.url,
+                user=e.user, language=e.language, custom_emoji_id=e.custom_emoji_id,
+            )
+            for e in (msg.caption_entities or []) if e.offset >= cut
+        ]
+        media = {"chat_id": msg.chat_id, "message_id": msg.message_id, "kind": kind,
+                 "caption": stripped, "entities": entities or None, "html": False}
+        draft["text"] = stripped
+    else:
+        media = {"chat_id": msg.chat_id, "message_id": msg.message_id, "kind": kind,
+                 "caption": None, "entities": None, "html": False}   # keep the original caption untouched
+        draft["text"] = caption
+    draft["media"] = media
+
+    body, markup = _broadcast_composer_view(admin_id)
+    await msg.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def _deliver_broadcast_item(bot, uid: int, text: str | None, media: dict | None) -> None:
+    """One broadcast delivery to one chat: the attachment (copy_message,
+    so any type works, with the caption override when there is one) or
+    the plain HTML text. Raises whatever Telegram raises — callers
+    decide what a failure means."""
+    if not media:
+        await bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+        return
+    kwargs = dict(chat_id=uid, from_chat_id=media["chat_id"], message_id=media["message_id"])
+    if media.get("caption") is not None and media["kind"] in BROADCAST_CAPTIONABLE_KINDS:
+        kwargs["caption"] = media["caption"]
+        if media.get("entities"):
+            kwargs["caption_entities"] = media["entities"]
+        elif media.get("html"):
+            kwargs["parse_mode"] = ParseMode.HTML
+    await bot.copy_message(**kwargs)
+
+async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, audience: str, text: str | None, recipients: list, media: dict | None = None) -> None:
     """Sends text to every id in recipients, editing status_message into
     a live progress bar + rolling ETA (re-estimated from the actual
     send rate so far, refreshed at most every
@@ -11841,7 +12156,7 @@ async def _send_broadcast(context: ContextTypes.DEFAULT_TYPE, status_message, au
 
     for i, uid in enumerate(recipients, 1):
         try:
-            await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+            await _deliver_broadcast_item(context.bot, uid, text, media)
             success += 1
         except Forbidden:
             # The user actually blocked the bot (or deleted their account) —
@@ -12455,6 +12770,7 @@ async def _post_init(app):
     await restore_storage_from_channel(app)
     for y in configured_years():
         await restore_quiz_from_channel(app, y)
+    await _freeze_legacy_lecture_links(app)   # lecture uids + legacy-link table — see _lecture_uid
     await restore_analytics_from_channel(app)
     await restore_settings_from_channel(app)
     await restore_lecture_results_from_channel(app)
@@ -12916,6 +13232,10 @@ app.add_handler(MessageHandler(
     filters.StatusUpdate.PINNED_MESSAGE & filters.Chat(BACKUP_CHAT_IDS),
     delete_pin_service_message,
 ))
+
+# Broadcast attachments (captioned "/broadcast ..." or sent while the
+# composer waits for its message) — must precede the media handlers below.
+app.add_handler(MessageHandler(_BroadcastAttachmentFilter(), broadcast_media_cmd))
 
 app.add_handler(CommandHandler("start",          start))
 app.add_handler(CommandHandler("c",              commands_cmd))
