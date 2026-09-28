@@ -3971,6 +3971,12 @@ LECTURE_SESSIONS       = {}    # user_id -> {"year","module","subject","lecture_
                                 #             start so _advance_lecture_session can look up a wrong
                                 #             answer's content in O(1) instead of scanning the whole
                                 #             year} — active one-at-a-time delivery
+# A user counts as an "active session" (/health + Dev Panel) only if they
+# answered a poll within this many seconds AND still have a live session.
+# The answer time lives inside the session dict itself ("last_answer_at"), so
+# it rides along with session persistence and survives a redeploy/restart.
+ACTIVE_SESSION_WINDOW_SECONDS = 10 * 60
+
 # Message IDs of question messages delivered by the bot, keyed by recipient.
 # The bounded list is enough to recognize later ❤️ reactions without letting
 # old questions grow memory usage forever.
@@ -6061,6 +6067,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     poll_id = answer.poll_id
     user_id = answer.user.id
     _update_telegram_name(user_id, answer.user)
+    _stamp_last_answer(user_id)
 
     daily_session = DAILY_QUIZ_SESSIONS.get(user_id)
     if daily_session and daily_session.get("current_poll_id") == poll_id:
@@ -6486,6 +6493,49 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
 def _add_lecture_item_count(entry: dict) -> int:
     return len(entry.get("ids", [])) + len(entry.get("written", []))
 
+# ── Debounced running-count message ─────────────────────────────────
+# handle_poll isn't serialized per user and concurrent_updates() is on, so when
+# an admin forwards a batch of polls at once every capture used to post its own
+# "✅ N سؤال اتسجل" message (each one read status_message_id before any of them
+# had stored the new id, so none deleted the others). Now each capture just
+# bumps a per-user generation counter and waits a moment; only the capture that
+# is still the newest after the delay posts the single message, with the count
+# read at that moment.
+ADD_LECTURE_STATUS_DELAY = 1.5   # seconds of quiet after the last capture before the count is posted
+_add_lecture_status_gen: dict[int, int] = {}
+_add_lecture_status_locks: dict[int, asyncio.Lock] = {}
+
+async def _refresh_add_lecture_status(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict) -> None:
+    gen = _add_lecture_status_gen.get(user_id, 0) + 1
+    _add_lecture_status_gen[user_id] = gen
+    await asyncio.sleep(ADD_LECTURE_STATUS_DELAY)
+    if _add_lecture_status_gen.get(user_id) != gen:
+        return   # a newer capture arrived meanwhile; it will post the message instead
+    lock = _add_lecture_status_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        if _add_lecture_status_gen.get(user_id) != gen:
+            return
+        if ADD_LECTURE_STATE.get(user_id) is not al_state:
+            return   # session was ended/cancelled during the wait — don't post a stale status
+        year, current = al_state["year"], al_state["lecture_key"]
+        entry = QUIZ_INDEX.get(year, {}).get(current)
+        if not entry:
+            return
+        old_status_id = al_state.get("status_message_id")
+        if old_status_id:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=old_status_id)
+            except Exception:
+                pass
+        count = _add_lecture_item_count(entry)
+        sent = await context.bot.send_message(
+            chat_id=user_id,
+            text=f"📚 <b>{current}</b>\n✅ {count} سؤال/جزء اتسجل لحد دلوقتي.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_add_lecture_status_markup(),
+        )
+        al_state["status_message_id"] = sent.message_id
+
 async def _capture_add_lecture_written(context: ContextTypes.DEFAULT_TYPE, user_id: int, al_state: dict, title: str, content: str, message_id: int):
     """Capture an auto-detected spoiler written question during /add_lecture."""
     year = al_state["year"]
@@ -6500,21 +6550,7 @@ async def _capture_add_lecture_written(context: ContextTypes.DEFAULT_TYPE, user_
     al_state.setdefault("session_written_ids", []).append(message_id)
     await save_quiz_index(year)
 
-    old_status_id = al_state.get("status_message_id")
-    if old_status_id:
-        try:
-            await context.bot.delete_message(chat_id=user_id, message_id=old_status_id)
-        except Exception:
-            pass
-
-    count = _add_lecture_item_count(entry)
-    sent = await context.bot.send_message(
-        chat_id=user_id,
-        text=f"📚 <b>{current}</b>\n✅ {count} سؤال/جزء اتسجل لحد دلوقتي.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_add_lecture_status_markup(),
-    )
-    al_state["status_message_id"] = sent.message_id
+    await _refresh_add_lecture_status(context, user_id, al_state)
 
 async def _close_add_lecture(context: ContextTypes.DEFAULT_TYPE, real_uid: int, al_state: dict):
     """Shared close logic for the End Lecture button and typed -END/-FIN.
@@ -6708,21 +6744,7 @@ async def _capture_add_lecture_poll(update: Update, context: ContextTypes.DEFAUL
         })
         await save_quiz_index(year)
 
-    old_status_id = al_state.get("status_message_id")
-    if old_status_id:
-        try:
-            await context.bot.delete_message(chat_id=user_id, message_id=old_status_id)
-        except Exception:
-            pass
-
-    count = _add_lecture_item_count(QUIZ_INDEX[year][current])
-    sent = await context.bot.send_message(
-        chat_id=user_id,
-        text=f"📚 <b>{current}</b>\n✅ {count} سؤال/جزء اتسجل لحد دلوقتي.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_add_lecture_status_markup(),
-    )
-    al_state["status_message_id"] = sent.message_id
+    await _refresh_add_lecture_status(context, user_id, al_state)
 
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.poll:
@@ -11203,10 +11225,10 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/feedback <message> — sends the user's nickname, Telegram
     username, and Telegram ID together with their feedback text straight
-    to STORAGE_GROUP_ID. Simple one-shot command (no draft/confirm step,
+    to the Creator's DM (ADMIN_ID). Simple one-shot command (no draft/confirm step,
     unlike /report_issue) — whatever follows /feedback on the same
     message is sent as-is."""
-    if not STORAGE_GROUP_ID:
+    if not ADMIN_ID:
         await update.message.reply_text("⚠️ الميزة دي مش متاحة دلوقتي.")
         return
     if not context.args:
@@ -11228,7 +11250,7 @@ async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💬 {html.escape(feedback_text)}"
     )
     try:
-        await context.bot.send_message(chat_id=STORAGE_GROUP_ID, text=message, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=ADMIN_ID, text=message, parse_mode=ParseMode.HTML)
     except Exception as e:
         print("FEEDBACK SEND FAILED:", e)
         await update.message.reply_text("⚠️ حصل خطأ وأنا بحاول أبعت الفيدباك، جرب تاني كمان شوية.")
@@ -11504,7 +11526,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("⚙️ Settings — from the /start menu: set your nickname")
     lines.append("/cancel — cancels whatever's currently in progress (pending image, etc.)")
     lines.append("/report_issue — send a message straight to the admin")
-    lines.append("/feedback &lt;message&gt; — send feedback (nickname + username included) to the storage channel")
+    lines.append("/feedback &lt;message&gt; — send feedback (nickname + username included) to the Creator's DM")
     lines.append("/quiz — browse lectures (year → module → subject → lecture) and pull their questions")
     lines.append("/time — current time, and when the next 💥Daily Quiz💥 push is")
     lines.append("/c — this list")
@@ -11589,19 +11611,51 @@ def admin_role_label(user_id: int) -> str:
     return "Student"
 
 
+def _stamp_last_answer(user_id: int) -> None:
+    """Records "this user just answered a poll" on each of their live sessions
+    (lecture / daily quiz / mistakes retake / bookmarks retake). Stored in the
+    session dict so it's persisted + restored with the session."""
+    now = time.time()
+    for store in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS, BOOKMARKS_RETAKE_SESSIONS):
+        session = store.get(user_id)
+        if session is not None:
+            session["last_answer_at"] = now
+
+def _count_registered_users() -> int:
+    """Users = people who actually registered a nickname (SETTINGS[uid]['nickname']).
+    USERS is every chat that ever hit /start, including people who never finished
+    onboarding, so it over-counts."""
+    return sum(1 for entry in SETTINGS.values() if entry.get("nickname"))
+
+def _count_active_sessions() -> int:
+    """People who answered a poll in the last ACTIVE_SESSION_WINDOW_SECONDS and
+    still have a live session. Counted per user (not per session entry), so
+    nobody is counted twice. Finishing a session removes it from its dict,
+    which makes the user inactive right away. Sessions restored after a
+    redeploy keep their last_answer_at; ones saved before this field existed
+    read as inactive until their owner answers again."""
+    now = time.time()
+    active = set()
+    for store in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS, BOOKMARKS_RETAKE_SESSIONS):
+        for uid, session in store.items():
+            if now - (session.get("last_answer_at") or 0) <= ACTIVE_SESSION_WINDOW_SECONDS:
+                active.add(uid)
+    return len(active)
+
+
 def _dev_panel_stats() -> tuple[int, int, int, int]:
     """(total_users, total_lectures, total_questions, active_sessions) —
     the four numbers shown at the top of the Dev Panel. Lectures/questions
     are summed across every configured year's QUIZ_INDEX; a lecture's
     question count is len(ids) (see the QUIZ_INDEX schema comment)."""
-    total_users     = len(USERS)
+    total_users     = _count_registered_users()
     total_lectures  = sum(len(QUIZ_INDEX.get(y, {})) for y in YEAR_ORDER)
     total_questions = sum(
         len(entry.get("ids", []))
         for y in YEAR_ORDER
         for entry in QUIZ_INDEX.get(y, {}).values()
     )
-    active_sessions = len(LECTURE_SESSIONS) + len(DAILY_QUIZ_SESSIONS) + len(MISTAKES_RETAKE_SESSIONS)
+    active_sessions = _count_active_sessions()
     return total_users, total_lectures, total_questions, active_sessions
 
 def _dev_panel_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -11762,7 +11816,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{label.ljust(label_width)}  {'✅' if ok else '❌'}" for label, ok in backup_rows
     )
 
-    active_sessions = len(LECTURE_SESSIONS) + len(DAILY_QUIZ_SESSIONS) + len(MISTAKES_RETAKE_SESSIONS)
+    active_sessions = _count_active_sessions()
 
     now = time.time()
     errors_24h = sum(1 for t in _ERROR_LOG_TIMES if now - t < 24 * 3600)
@@ -11775,14 +11829,14 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"🟢 Bot: ONLINE\n"
-        f"👥 Users: {len(USERS)}\n"
+        f"👥 Users: {_count_registered_users()}\n"
         f"{lecture_lines}\n\n"
         f"💾 Backups:\n"
         f"<code>{backup_lines}</code>\n\n"
-        f"⚠️ Active sessions: {active_sessions}\n"
+        f"⚠️ Active sessions (answered in last 10 min): {active_sessions}\n"
         f"❌ Errors last 24h: {errors_24h}\n"
         f"⏱ Uptime: {uptime}\n\n"
-        f"<i>Sessions and error count are since the last restart — both reset when the process does.</i>"
+        f"<i>Error count is since the last restart — it resets when the process does.</i>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
