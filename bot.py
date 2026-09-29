@@ -58,10 +58,12 @@ from zoneinfo import ZoneInfo
 #          next text message is matched against every ready lecture's
 #          poll questions via _search_quiz_questions (Arabic-aware
 #          substring match, same normalization as the nickname filter).
-#          Results are resent as fresh live quiz polls straight into the
-#          chat via deliver_quiz (channel is private, so linking out
-#          isn't reliable). See _send_search_results for the shared send
-#          used by both the search itself and its "🔎 Search Again" button.
+#          Matches are shown as ONE paged list (numbered snippets + number
+#          buttons, SEARCH_RESULTS holds them); tapping a number resends
+#          that question as a live quiz poll via deliver_quiz (channel is
+#          private, so linking out isn't reliable). See
+#          _send_search_results / _search_list_view and the
+#          srchpick:/srchpage: callbacks.
 # 1114   LECTURE RESULTS — per-lecture leaderboard (own file + own
 #          backup channel: LECTURE_RESULTS_GROUP_ID)
 # 1267   MISTAKES BANK — per-user wrong-answer pool that seeds each user's
@@ -127,7 +129,16 @@ from zoneinfo import ZoneInfo
 #          admin drill into a lecture, pick one question (16-char
 #          preview), then delete it or reopen the lecture in the quiz
 #          channel to insert new poll(s) right after it via
-#          QUIZ_INSERT_AFTER, closed the same way as authoring: -END)
+#          QUIZ_INSERT_AFTER, closed the same way as authoring: -END).
+#          Also 🔎 Search Questions (eqsrch:/eqsrchpick:/eqsrchdel:/
+#          eqsrchpage:, see _eq_search_questions), and ➕ Tail poll (eqtail:,
+#          on a lecture's question list — same DM session as Insert-after but
+#          appending at the end of the lecture), and 📎 Add case / image
+#          (eqatt:/eqattc:/eqatti:/eqattxc:/eqattxi:, on a question's preview —
+#          attaches/replaces/removes a case study or image on an EXISTING
+#          question via poll_case_studies / poll_images) — type a word, get a
+#          paged list of every matching question across the year/module,
+#          open one to delete or edit it without drilling lecture by lecture)
 # 5437   START (also wakes bot from sleep; asks for a nickname on first use)
 # 5505   ADMIN HELPERS — is_admin, admin_bound_year/can_edit_year (each
 #          secondary admin in SECONDARY_ADMIN_YEARS is locked to one year
@@ -2565,10 +2576,41 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
     explanation = status.get("explanation")         if status else None
     if not (question and options and correct_id is not None):
         return None   # legacy/uncaptured content — skip rather than spend a forward+delete recovering it here
-    return {
+    snap = {
         "question": question, "options": options, "correct_option_id": correct_id,
         "explanation": explanation, "year": year, "module": module, "subject": subject,
+        "source_mid": mid,
     }
+    # Attach the question's photo / case study (stored on the lecture's
+    # QUIZ_INDEX entry, keyed by poll mid — see poll_images /
+    # poll_case_studies) so Daily Quiz / Mistakes retake can show them
+    # the same way lecture delivery does.
+    lecture_entry = QUIZ_INDEX.get(year, {}).get(status.get("lecture")) if status else None
+    if lecture_entry:
+        img = next((pi for pi in (lecture_entry.get("poll_images") or []) if pi.get("mid") == mid), None)
+        if img and img.get("file_id"):
+            snap["image_file_id"] = img["file_id"]
+        cs = next((c for c in (lecture_entry.get("poll_case_studies") or []) if c.get("mid") == mid), None)
+        if cs and cs.get("content"):
+            snap["case_study"] = cs["content"]
+    return snap
+
+def _attachment_index(year: str) -> dict:
+    """{mid: {"image_file_id"?, "case_study"?}} for every poll in `year`
+    that has a photo or case study bound to it (QUIZ_INDEX[year][*]
+    ["poll_images"] / ["poll_case_studies"]). Channel message ids are
+    unique per channel, so keying by mid alone across the whole year is
+    safe. Built fresh per call; callers resolving many mids should build
+    it once."""
+    out: dict = {}
+    for entry in QUIZ_INDEX.get(year, {}).values():
+        for pi in (entry.get("poll_images") or []):
+            if pi.get("mid") is not None and pi.get("file_id"):
+                out.setdefault(pi["mid"], {})["image_file_id"] = pi["file_id"]
+        for cs in (entry.get("poll_case_studies") or []):
+            if cs.get("mid") is not None and cs.get("content"):
+                out.setdefault(cs["mid"], {})["case_study"] = cs["content"]
+    return out
 
 def _scoped_mistakes_bank(user_id: int) -> list:
     """Returns only this user's type="mistake" records. Bookmark records
@@ -2595,14 +2637,18 @@ def _poll_status_index(year: str) -> dict:
     return {v["message_id"]: v for v in QUIZ_POLL_STATUS[year].values()}
 
 # ── 🔎 Search Content ──────────────────────────────────────────────
-# Matches are resent as fresh live quiz polls straight into the user's
-# DM (via deliver_quiz — the same single delivery path every other quiz
-# feature uses), NOT as links into the quiz channel — that channel is
-# private, so a t.me/c/ link wouldn't reliably open for everyone, and
-# resending keeps the whole search self-contained in the chat with
-# Quizzy. Kept small since each match is a handful of messages, not one
-# line — see _send_search_results.
-SEARCH_RESULTS_LIMIT = 8   # max questions resent per search — see _search_quiz_questions
+# A search sends ONE message: a numbered, paged list of every match
+# (question snippet + subject/lecture) with number buttons. Tapping a
+# number resends just that question as a fresh live quiz poll straight
+# into the chat (via deliver_quiz — the same single delivery path every
+# other quiz feature uses), NOT as a link into the quiz channel — that
+# channel is private, so a t.me/c/ link wouldn't reliably open for
+# everyone. The matches live in SEARCH_RESULTS (in-memory, one search per
+# chat, replaced by the next search) — see _send_search_results and the
+# srchpick:/srchpage: callbacks in button_handler.
+SEARCH_RESULTS_LIMIT = 100   # max matches listed per search (paged SEARCH_PAGE_SIZE at a time) — see _search_quiz_questions
+SEARCH_PAGE_SIZE      = 10   # questions shown per page of the results list
+SEARCH_SNIPPET_CHARS  = 90   # how much of each question's text the list shows
 
 def _search_quiz_questions(year: str, module: str | None, query_text: str,
                             limit: int = SEARCH_RESULTS_LIMIT) -> tuple[list, int]:
@@ -2670,37 +2716,73 @@ def _search_again_markup(year: str, module: str | None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
     ])
 
+SEARCH_RESULTS: dict[int, dict] = {}   # chat_id -> {"token", "year", "module", "query", "matches", "total", "page", "sent"}
+
+def _search_list_view(state: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Builds one page of the results list: numbered questions in the text,
+    a grid of number buttons under it (✅ once that question was sent),
+    ⬅️/➡️ paging when there's more than one page, then Search Again / Home."""
+    matches, total = state["matches"], state["total"]
+    pages = max(1, (len(matches) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    state["page"] = page
+    start = page * SEARCH_PAGE_SIZE
+    chunk = matches[start:start + SEARCH_PAGE_SIZE]
+
+    scope_line = f"📚 {_search_scope_label(state['year'], state['module'])}\n🔎 \"{html.escape(state['query'][:80])}\""
+    capped = f" (بعرض أول {len(matches)} — دقق البحث أكتر لو مش لاقي اللي عايزه)" if total > len(matches) else ""
+    page_note = f" — صفحة {page + 1}/{pages}" if pages > 1 else ""
+    lines = [scope_line, "", f"✅ لاقيت {total} سؤال{capped}{page_note}", "اختار رقم السؤال اللي عايز تبعته 👇", ""]
+    for i, m in enumerate(chunk, start + 1):
+        snippet = " ".join(str(m["question"]).split())
+        if len(snippet) > SEARCH_SNIPPET_CHARS:
+            snippet = snippet[:SEARCH_SNIPPET_CHARS].rstrip() + "…"
+        lines.append(f"<b>{i}.</b> {html.escape(snippet)}")
+        lines.append(f"     ↳ {subject_label(m['subject'])} — {html.escape(m['lecture_name'])}")
+
+    token = state["token"]
+    num_buttons = [
+        InlineKeyboardButton(
+            f"✅ {i}" if (i - 1) in state["sent"] else str(i),
+            callback_data=f"srchpick:{token}:{i - 1}",
+        )
+        for i in range(start + 1, start + len(chunk) + 1)
+    ]
+    rows = [num_buttons[j:j + 5] for j in range(0, len(num_buttons), 5)]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"srchpage:{token}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"srchpage:{token}:{page + 1}"))
+        rows.append(nav)
+    rows.extend(_search_again_markup(state["year"], state["module"]).inline_keyboard)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
 async def _send_search_results(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                  year: str, module: str | None, query_text: str):
-    """Runs the search, then resends each match as its own fresh live
-    quiz poll (deliver_quiz) directly into chat_id, each preceded by a
-    one-line caption naming its subject/lecture. Ends with a "🔎 Search
-    Again" / "🏠 Back to Home" prompt either way — see _search_again_markup.
-    """
+    """Runs the search, then sends ONE message listing every match with
+    number buttons to pick which question(s) to resend as live quiz polls
+    (see the srchpick:/srchpage: callbacks in button_handler). Nothing is
+    delivered until the user picks. With no matches, just the "no results"
+    message with Search Again / Home — see _search_again_markup."""
     matches, total = _search_quiz_questions(year, module, query_text)
-    scope_line = f"📚 {_search_scope_label(year, module)}\n🔎 \"{html.escape(query_text[:80])}\""
-    again_markup = _search_again_markup(year, module)
 
     if not matches:
+        scope_line = f"📚 {_search_scope_label(year, module)}\n🔎 \"{html.escape(query_text[:80])}\""
         await context.bot.send_message(
             chat_id, scope_line + "\n\n📭 مفيش أسئلة اتطابقت مع البحث ده.",
-            parse_mode=ParseMode.HTML, reply_markup=again_markup,
+            parse_mode=ParseMode.HTML, reply_markup=_search_again_markup(year, module),
         )
         return
 
-    note = "" if total <= len(matches) else f" (بتعرض {len(matches)} من {total} — دقق البحث أكتر لو مش لاقي اللي عايزه)"
-    await context.bot.send_message(
-        chat_id, scope_line + f"\n\n✅ لاقيت {len(matches)} سؤال{note}:",
-        parse_mode=ParseMode.HTML,
-    )
-    for i, m in enumerate(matches, 1):
-        where = f"{subject_label(m['subject'])} — {html.escape(m['lecture_name'])}"
-        await context.bot.send_message(chat_id, f"{i}. {where}", parse_mode=ParseMode.HTML)
-        await deliver_quiz(
-            context, chat_id, m["question"], m["options"], m["correct_option_id"],
-            explanation=m.get("explanation"),
-        )
-    await context.bot.send_message(chat_id, "🔎 عايز تبحث تاني؟", reply_markup=again_markup)
+    state = {
+        "token": secrets.token_hex(3), "year": year, "module": module, "query": query_text,
+        "matches": matches, "total": total, "page": 0, "sent": set(),
+    }
+    SEARCH_RESULTS[chat_id] = state   # replaces this chat's previous search; older lists now read as expired
+    text, markup = _search_list_view(state, 0)
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, status_by_mid: dict | None = None) -> dict | None:
     """Turns one lightweight MISTAKES_BANK entry ({mid, year, module,
@@ -2878,13 +2960,30 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     session["delivered_count"] = session.get("delivered_count", 0) + 1
     timer_seconds = get_question_timer_seconds(user_id)
     options, correct_option_id = _shuffled_options(q["options"], q["correct_option_id"])
+    if q.get("case_study"):
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, text=html.escape(q["case_study"]), parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            print(f"Couldn't send case study for daily quiz question: {e}")
+    poll_kwargs = dict(
+        chat_id=user_id, question=_numbered_question(q["question"], session["delivered_count"]), options=options,
+        type="quiz", correct_option_id=correct_option_id, is_anonymous=False,
+        explanation=(q.get("explanation") or None),
+        open_period=(timer_seconds or None),
+    )
     try:
-        msg = await context.bot.send_poll(
-            chat_id=user_id, question=_numbered_question(q["question"], session["delivered_count"]), options=options,
-            type="quiz", correct_option_id=correct_option_id, is_anonymous=False,
-            explanation=(q.get("explanation") or None),
-            open_period=(timer_seconds or None),
-        )
+        if q.get("image_file_id"):
+            try:
+                msg = await context.bot.send_poll(**poll_kwargs, media=InputMediaPhoto(q["image_file_id"]))
+            except Exception as e:
+                # Same fallback as lecture delivery: separate photo, then the poll.
+                print(f"POLL MEDIA ERROR for daily quiz question (falling back to separate image message): {e}")
+                await context.bot.send_photo(chat_id=user_id, photo=q["image_file_id"])
+                msg = await context.bot.send_poll(**poll_kwargs)
+        else:
+            msg = await context.bot.send_poll(**poll_kwargs)
     except Exception as e:
         print(f"Couldn't send daily quiz question: {e}")
         session["delivered_count"] -= 1   # this send never went out — don't burn a number on it
@@ -2898,6 +2997,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         "year": q.get("year"),
         "module": q.get("module"),
         "subject": q.get("subject"),
+        "source_mid": q.get("source_mid"),
     }
     _remember_bookmarkable_question(
         user_id, msg.message_id, question_key=daily_qkey, metadata=daily_meta,
@@ -3444,18 +3544,41 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
 BOOKMARKS_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
 
 def _resolved_bookmarks(user_id: int) -> list:
-    """This user's bookmark entries, filtered to ones with enough content
-    to resend as a poll (question + at least 2 options + a valid
-    correct_option_id) — same bar _resolve_mistake enforces for mistakes,
-    just without a lookup since the snapshot is already on the entry."""
+    """This user's bookmark entries as self-contained question dicts ready
+    to resend as polls. Each is a COPY of the stored entry (the persisted
+    bank entry is never mutated, so images/cases don't bloat the bank).
+
+    Bookmarks saved from the ❤️ reaction don't store the correct answer or
+    explanation, and never store a photo or case study — so when the entry
+    has a year + source_mid, the missing pieces are looked up from
+    QUIZ_POLL_STATUS[year] / QUIZ_INDEX[year] by that mid (same source the
+    lecture and Daily Quiz deliveries use). Values the entry already has
+    win over the lookup. Entries without a source_mid (older
+    Daily-Quiz-saved bookmarks, ad-hoc questions) just use what they
+    stored: they retake fine if complete, without an image/case."""
+    status_by_year: dict = {}
+    attach_by_year: dict = {}
     resolved = []
     for entry in _bookmark_list(user_id):
-        question = entry.get("question")
-        options  = entry.get("options") or []
-        correct  = entry.get("correct_option_id")
+        item = dict(entry)
+        year, mid = item.get("year"), item.get("source_mid")
+        if year and mid is not None and year in QUIZ_POLL_STATUS:
+            if year not in status_by_year:
+                status_by_year[year] = _poll_status_index(year)
+                attach_by_year[year] = _attachment_index(year)
+            status = status_by_year[year].get(mid)
+            if status:
+                if not isinstance(item.get("correct_option_id"), int):
+                    item["correct_option_id"] = status.get("correct_option_id")
+                if not item.get("explanation"):
+                    item["explanation"] = status.get("explanation")
+            item.update(attach_by_year[year].get(mid, {}))
+        question = item.get("question")
+        options  = item.get("options") or []
+        correct  = item.get("correct_option_id")
         if not question or len(options) < 2 or not isinstance(correct, int) or not (0 <= correct < len(options)):
             continue
-        resolved.append(entry)
+        resolved.append(item)
     return resolved
 
 async def start_bookmarks_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
@@ -4094,6 +4217,23 @@ def _unbookmark_question(user_id: int, meta: dict) -> bool:
     _mark_mistakes_bank_dirty()
     return True
 
+def _clear_user_bookmarks(user_id: int) -> int:
+    """Deletes ALL of this user's type="bookmarked" entries from the shared
+    bank (never touches their mistakes or anyone else's entries). Matched
+    by object identity so the removal is exact. Returns how many were
+    removed; the caller saves + backs up the bank."""
+    doomed = {id(e) for e in _bookmark_entries(user_id)}
+    if not doomed:
+        return 0
+    MISTAKES_BANK[:] = [m for m in MISTAKES_BANK if id(m) not in doomed]
+    remaining = [m for m in _MISTAKES_BY_USER.get(user_id, []) if id(m) not in doomed]
+    if remaining:
+        _MISTAKES_BY_USER[user_id] = remaining
+    else:
+        _MISTAKES_BY_USER.pop(user_id, None)
+    _mark_mistakes_bank_dirty()
+    return len(doomed)
+
 def _remember_bookmarkable_question(
     user_id: int,
     message_id: int | None,
@@ -4188,6 +4328,20 @@ AWAITING_SEARCH_QUERY  = {}    # real_uid -> {"year": str, "module": str|None}
 # to catch the admin's next typed message as the new question/options/
 # explanation for the poll they picked. Popped as soon as it's consumed,
 # same pattern as AWAITING_SEARCH_QUERY above.
+# /edit_quiz 🔎 search: AWAITING_EQ_SEARCH is armed by eqsrch:<year>:<mod_idx|all>
+# and consumed by the admin's next typed message (see handle()); the matches
+# then live in EQ_SEARCH_RESULTS (one search per admin, replaced by the
+# next one) behind the eqsrchpick:/eqsrchdel:/eqsrchpage: buttons.
+AWAITING_EQ_SEARCH = {}   # real_uid -> {"year": str, "mod_idx": int | None}
+
+# /edit_quiz 📎 Add case / image on an EXISTING question: armed by eqattc:/eqatti:
+# and consumed by the admin's next text message (kind "case") or photo (kind
+# "image") — see handle() / handle_image(). Stored on the lecture entry in the
+# same poll_case_studies / poll_images lists /add_lecture fills, so delivery
+# (_deliver_next_lecture_question) needs no changes.
+AWAITING_EQ_ATTACH = {}   # real_uid -> {"kind": "case"|"image", "year", "mid", "mod_idx", "subj_idx", "lec_idx"}
+EQ_SEARCH_RESULTS  = {}   # real_uid -> {"token","year","mod_idx","query","matches","page"}
+
 AWAITING_EQEDIT = {}    # real_uid -> {"kind": "question"|"options"|"explanation",
                          #              "year", "mid", "mod_idx", "subj_idx", "lec_idx"}
 
@@ -5323,12 +5477,12 @@ def settings_menu_keyboard(user_id: int, page: int = 1) -> InlineKeyboardMarkup:
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
     rows = [
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
+        [InlineKeyboardButton("📚 Change Year", callback_data="settings_year")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
         [InlineKeyboardButton(f"🔀 Mix Written: {_tag(mix_written)}", callback_data="toggle_mix_written")],
         [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
         [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
-        [InlineKeyboardButton("🗑 Clear Mistake Bank", callback_data="clear_mistakes_bank_ask")],
         [InlineKeyboardButton("➡️ More Settings", callback_data="settings_page:2")],
         [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
     ]
@@ -5361,25 +5515,37 @@ HOW_TO_USE_TEXT = (
 # ═══════════════════════════════════════════════════════════════
 # REACTIONS
 # ═══════════════════════════════════════════════════════════════
-async def _reaction_toast(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, *, delay: float = 1.8):
-    """Toast-like acknowledgement for reaction-driven actions.
+TOAST_DELETE_SECONDS = 8      # every toast-style message deletes itself after this many seconds
+_TOAST_TASKS: set = set()     # strong refs so the background delete tasks aren't garbage-collected
 
-    Telegram's reaction update has no callback-query toast API, so this is a
-    tiny silent message that disappears shortly afterward.
-    """
+async def _send_toast_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, *, delay: float = TOAST_DELETE_SECONDS):
+    """Toast as a real (silent) message that deletes itself after `delay`
+    seconds. Used for every toast in the bot: button-tap toasts (see
+    _tap_toast / button_handler) and reaction acknowledgements. The delete
+    runs in a background task so it never blocks the handler that sent it."""
     try:
         sent = await context.bot.send_message(
-            chat_id=user_id, text=text, disable_notification=True,
+            chat_id=chat_id, text=text, disable_notification=True,
         )
     except Exception:
         return
     async def _remove():
         await asyncio.sleep(delay)
         try:
-            await context.bot.delete_message(chat_id=user_id, message_id=sent.message_id)
+            await context.bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
         except Exception:
             pass
-    asyncio.create_task(_remove())
+    task = asyncio.create_task(_remove())
+    _TOAST_TASKS.add(task)
+    task.add_done_callback(_TOAST_TASKS.discard)
+
+async def _reaction_toast(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, *, delay: float = TOAST_DELETE_SECONDS):
+    """Toast-like acknowledgement for reaction-driven actions.
+
+    Telegram's reaction update has no callback-query toast API, so this is a
+    tiny silent message that disappears shortly afterward.
+    """
+    await _send_toast_message(context, user_id, text, delay=delay)
 
 async def _record_question_report(
     context: ContextTypes.DEFAULT_TYPE,
@@ -6827,6 +6993,32 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _stage_report_draft(update, context, real_uid, text=report_caption, photo_file_id=report_photo.file_id)
         return
 
+    # ── /edit_quiz → 📎 Add case / image waiting on a photo (image half;
+    # the text half lives in handle()). Checked before the /add_lecture
+    # branch below — arming is refused while an add session is open, so the
+    # two can't both be waiting on this admin's next message.
+    pending_att = AWAITING_EQ_ATTACH.get(real_uid)
+    if pending_att and is_admin(update):
+        if not can_edit_year(update, pending_att["year"]):
+            AWAITING_EQ_ATTACH.pop(real_uid, None)
+            return
+        att_photo = update.message.photo[-1] if update.message.photo else None
+        if not att_photo:
+            return
+        if pending_att["kind"] != "image":
+            await update.message.reply_text("📝 مستني نص (Case study) مش صورة — ابعت النص، أو دوس Cancel.")
+            return
+        AWAITING_EQ_ATTACH.pop(real_uid, None)
+        err = await _apply_eq_attach(
+            context, pending_att, photo=att_photo,
+            spoiler=bool(getattr(update.message, "has_media_spoiler", False)),
+        )
+        await update.message.reply_text(
+            err or "✅ اتسجلت الصورة — هتظهر مع السؤال ده.",
+            reply_markup=None if err else _eq_att_done_markup(pending_att),
+        )
+        return
+
     # ── /add_lecture DM authoring in progress for this admin: a plain
     # (not forwarded) photo is a pending image for whichever poll gets
     # forwarded next — see ADD_LECTURE_STATE's "pending_image" field and
@@ -6979,7 +7171,7 @@ ONBOARDING_SPECIAL_TEXT = (
     "بصمجة يا دولي 😂)\n\n"
     "<b>🧠 Mistakes Bank</b>\n"
     "أي سؤال تغلط فيه بيتسجل هنا تلقائي، عشان ترجعله وتراجعه تاني وقت ما تحب. وتقدر تنظفه من "
-    "الإعدادات (أخيراً بقا في زرار يمسح آخطاء الماضي ❤️‍🩹)\n\n"
+    "جوا الـ Mistakes Bank نفسه (أخيراً بقا في زرار يمسح آخطاء الماضي ❤️‍🩹)\n\n"
     "<b>📊 My Stats 📈</b>\n"
     "شوف الـ XP والـ Level بتاعك، عدد الأسئلة الصح والغلط، والـ achievements اللي فتحتها وحاجات "
     "تانيه كتير (جدا) 🔥🔥\n\n"
@@ -7866,6 +8058,39 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _apply_eqedit(update, context, pending_eqedit, text)
         return
 
+    # ── AWAITING EQ ATTACH (/edit_quiz → 📎 Add case / image, text half) ──
+    pending_att = AWAITING_EQ_ATTACH.get(real_uid)
+    if pending_att:
+        if not is_admin(update) or not can_edit_year(update, pending_att["year"]):
+            AWAITING_EQ_ATTACH.pop(real_uid, None)
+            return
+        if pending_att["kind"] != "case":
+            await update.message.reply_text("🖼 مستني صورة مش نص — ابعت الصورة، أو دوس Cancel.")
+            return
+        content = text.strip()
+        if not content:
+            return
+        if len(content) > 4000:
+            await update.message.reply_text("⚠️ النص طويل أوي (أقصى حاجة 4000 حرف) — قصّره وابعته تاني.")
+            return
+        AWAITING_EQ_ATTACH.pop(real_uid, None)
+        err = await _apply_eq_attach(context, pending_att, text=content)
+        await update.message.reply_text(
+            err or "✅ اتسجل الـ Case study — هيظهر قبل السؤال ده.",
+            reply_markup=None if err else _eq_att_done_markup(pending_att),
+        )
+        return
+
+    # ── AWAITING EQ SEARCH (/edit_quiz → 🔎 Search Questions) ────────
+    # Armed by eqsrch: in button_handler; admin + year re-checked here as
+    # defense in depth, same as the AWAITING_EQEDIT block above.
+    pending_eqsearch = AWAITING_EQ_SEARCH.pop(real_uid, None)
+    if pending_eqsearch:
+        if not can_edit_year(update, pending_eqsearch["year"]):
+            return
+        await _eq_run_search(context, user_id, real_uid, pending_eqsearch["year"], pending_eqsearch["mod_idx"], text)
+        return
+
     # ── AWAITING NICKNAME (Settings, or first-ever /start) ───────
     # Keyed by real_uid (the person's Telegram user id, same key SETTINGS
     # uses), not the chat id, so this works the same in DMs and groups.
@@ -8127,6 +8352,7 @@ QUIZZY_MISTAKES_HIGH_MSG     = "🐱 they say mistakes make you stronger, how mu
 TOAST_SR_NEEDS_AUTO_NEXT   = "⚠️ Spaced Repetition لازم يكون معاه Auto-Next شغال"
 TOAST_AUTO_NEXT_OFF_SR     = "⚠️ قفلت Auto-Next، فـ Spaced Repetition مش هيشتغل لحد ما ترجعه"
 TOAST_BANK_ALREADY_EMPTY   = "🎉 بنك الأخطاء بتاعك فاضي أصلاً!"
+TOAST_BOOKMARKS_ALREADY_EMPTY = "مفيش أسئلة محفوظة أصلاً! ❤️"
 TOAST_REPORT_CLOSED        = "⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني."
 TOAST_REPORT_NOT_YOURS     = "⚠️ مش قادر أعمل كده."
 QUIZZY_MISTAKES_HIGH_THRESHOLD = 10   # mistake count at/above which the bench-press jab fires
@@ -8209,7 +8435,7 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
             turning_off = get_auto_next_enabled(user_id)
             return TOAST_AUTO_NEXT_OFF_SR if (turning_off and get_spaced_repetition_enabled(user_id)) else None
 
-        # ── Settings: Clear Mistakes Bank ──
+        # ── Mistakes Bank menu: Clear Mistakes Bank ──
         if data == "clear_mistakes_bank_ask":
             # same scoped count the handler uses for its own empty check
             return TOAST_BANK_ALREADY_EMPTY if not _scoped_mistakes_bank(user_id) else None
@@ -8220,6 +8446,12 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
             # counted — so count that same set.
             cleared = len(_scoped_mistakes_bank(user_id))
             return f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك."
+
+        # ── Bookmarks: Clear Bookmarks ──
+        if data == "clear_bookmarks_ask":
+            return TOAST_BOOKMARKS_ALREADY_EMPTY if not _bookmark_entries(user_id) else None
+        if data == "clear_bookmarks_yes":
+            return f"✅ اتمسح {len(_bookmark_entries(user_id))} سؤال من الـ Bookmarks بتاعتك."
 
         # ── Report follow-up: the reporter's own "↩️ Reply" button ──
         if data.startswith("report_user_reply:"):
@@ -8236,7 +8468,6 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
 # ═══════════════════════════════════════════════════════════════
 # INLINE BUTTON HANDLER
 # ═══════════════════════════════════════════════════════════════
-@_serialize_per_user
 def _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx):
     """Shared lookup+validation for the lecture level of /edit_quiz
     (eqlecture:/eqmsstart: and friends) — mirrors the inline checks each
@@ -8276,6 +8507,200 @@ def _eq_resolve(year, mod_idx, subj_idx, lec_idx, mid):
     if not status or not status.get("question") or not status.get("options"):
         return "⚠️ مفيش بيانات محفوظة للسؤال ده يتعدل (سؤال قديم قبل ما التسجيل يتفعل).", None, None, None, None, None
     return None, entry, lecture_key, ids, pid, status
+
+EQ_SEARCH_LIMIT = 100        # max matches listed per /edit_quiz search
+EQ_SEARCH_PAGE_SIZE = 10     # matches per page of the results list
+
+def _eq_search_questions(year: str, mod_idx: int | None, query_text: str) -> list:
+    """Finds poll questions in `year` (optionally only module #mod_idx of
+    ready_modules(year)) whose question text OR any option contains
+    query_text (same Arabic-aware normalization as user-side Search
+    Content). Each match carries the mod/subj/lec indices the existing
+    eqq:/eqedit: callbacks need. Only lectures /edit_quiz itself lists
+    (ready_lecture_keys: closed + non-empty) are searched, so every hit is
+    reachable through the normal flow too. Capped at EQ_SEARCH_LIMIT."""
+    needle = _normalize_for_filter(query_text)
+    if not needle:
+        return []
+    modules = ready_modules(year)
+    status_by_mid = _poll_status_index(year)
+    matches = []
+    for m_idx, module in enumerate(modules):
+        if mod_idx is not None and m_idx != mod_idx:
+            continue
+        for s_idx, subject in enumerate(ready_subjects(year, module)):
+            for l_idx, lecture_key in enumerate(ready_lecture_keys(year, module, subject)):
+                entry = QUIZ_INDEX[year][lecture_key]
+                for mid in entry["ids"]:
+                    status = status_by_mid.get(mid)
+                    question = status.get("question") if status else None
+                    if not question:
+                        continue
+                    haystack = " ".join([str(question)] + [str(o) for o in (status.get("options") or [])])
+                    if needle not in _normalize_for_filter(haystack):
+                        continue
+                    matches.append({
+                        "mid": mid, "question": str(question),
+                        "lecture_name": entry.get("name", "؟"), "subject": subject,
+                        "mod_idx": m_idx, "subj_idx": s_idx, "lec_idx": l_idx,
+                    })
+                    if len(matches) >= EQ_SEARCH_LIMIT:
+                        return matches
+    return matches
+
+def _eq_search_back_markup(year: str, mod_idx: int | None) -> InlineKeyboardMarkup:
+    back = f"eqyr:{year}" if mod_idx is None else f"eqmodule:{year}:{mod_idx}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Search Again", callback_data=f"eqsrch:{year}:{'all' if mod_idx is None else mod_idx}")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data=back)],
+    ])
+
+def _eq_search_scope(year: str, mod_idx: int | None) -> str:
+    if mod_idx is None:
+        return f"{year_label(year)} — All Modules"
+    modules = ready_modules(year)
+    return f"{year_label(year)} — {module_label(modules[mod_idx]) if mod_idx < len(modules) else '؟'}"
+
+def _eq_search_list_view(state: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """One page of the /edit_quiz search results: numbered snippets +
+    number buttons (eqsrchpick:), ⬅️/➡️ paging, Search Again / Back."""
+    matches = state["matches"]
+    pages = max(1, (len(matches) + EQ_SEARCH_PAGE_SIZE - 1) // EQ_SEARCH_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    state["page"] = page
+    start = page * EQ_SEARCH_PAGE_SIZE
+    chunk = matches[start:start + EQ_SEARCH_PAGE_SIZE]
+
+    capped = f" (أول {EQ_SEARCH_LIMIT} بس — دقق البحث أكتر)" if len(matches) >= EQ_SEARCH_LIMIT else ""
+    page_note = f" — صفحة {page + 1}/{pages}" if pages > 1 else ""
+    lines = [
+        f"✏️ 📚 {_eq_search_scope(state['year'], state['mod_idx'])}",
+        f"🔎 \"{html.escape(state['query'][:80])}\"",
+        "",
+        f"✅ لاقيت {len(matches)} سؤال{capped}{page_note}",
+        "اختار رقم السؤال عشان تفتحه (تحذفه أو تعدله) 👇",
+        "",
+    ]
+    for i, m in enumerate(chunk, start + 1):
+        snippet = " ".join(m["question"].split())
+        if len(snippet) > 90:
+            snippet = snippet[:90].rstrip() + "…"
+        lines.append(f"<b>{i}.</b> {html.escape(snippet)}")
+        lines.append(f"     ↳ {subject_label(m['subject'])} — {html.escape(m['lecture_name'])}")
+
+    token = state["token"]
+    nums = [
+        InlineKeyboardButton(str(i), callback_data=f"eqsrchpick:{token}:{m['mid']}")
+        for i, m in enumerate(chunk, start + 1)
+    ]
+    rows = [nums[j:j + 5] for j in range(0, len(nums), 5)]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"eqsrchpage:{token}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"eqsrchpage:{token}:{page + 1}"))
+        rows.append(nav)
+    rows.extend(_eq_search_back_markup(state["year"], state["mod_idx"]).inline_keyboard)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+async def _eq_run_search(context: ContextTypes.DEFAULT_TYPE, chat_id: int, admin_id: int,
+                         year: str, mod_idx: int | None, query_text: str) -> None:
+    matches = _eq_search_questions(year, mod_idx, query_text)
+    if not matches:
+        EQ_SEARCH_RESULTS.pop(admin_id, None)
+        await context.bot.send_message(
+            chat_id,
+            f"✏️ 📚 {_eq_search_scope(year, mod_idx)}\n🔎 \"{html.escape(query_text[:80])}\"\n\n📭 مفيش أسئلة اتطابقت مع البحث ده.",
+            parse_mode=ParseMode.HTML, reply_markup=_eq_search_back_markup(year, mod_idx),
+        )
+        return
+    state = {"token": secrets.token_hex(3), "year": year, "mod_idx": mod_idx,
+             "query": query_text, "matches": matches, "page": 0}
+    EQ_SEARCH_RESULTS[admin_id] = state
+    text, markup = _eq_search_list_view(state, 0)
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+def _eq_att_lecture_of(year: str, mid: int):
+    """(lecture_key, entry) of the lecture currently holding poll `mid`, or (None, None)."""
+    for k, v in QUIZ_INDEX.get(year, {}).items():
+        if mid in v.get("ids", []):
+            return k, v
+    return None, None
+
+def _eq_att_menu(year: str, mod_idx: int, subj_idx: int, lec_idx: int, mid: int):
+    """Text + keyboard of the 📎 case/image submenu for one existing question.
+    Returns (error_text_or_None, text, markup)."""
+    err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
+    if err:
+        return err, None, None
+    if mid not in ids:
+        return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.", None, None
+    status = _poll_status_index(year).get(mid) or {}
+    question = " ".join(str(status.get("question") or "؟؟؟").split())
+    if len(question) > 150:
+        question = question[:150].rstrip() + "…"
+    case = next((c for c in (entry.get("poll_case_studies") or []) if c["mid"] == mid), None)
+    image = next((i for i in (entry.get("poll_images") or []) if i["mid"] == mid), None)
+    idx = f"{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}"
+    case_state = f"✅ موجود ({len(case['content'])} حرف)" if case else "—"
+    text = (
+        f"📎 <b>Case study / صورة</b> — {html.escape(entry['name'])}\n\n"
+        f"❓ {html.escape(question)}\n\n"
+        f"📝 Case study: {case_state}\n"
+        f"🖼 صورة: {'✅ موجودة' if image else '—'}\n\n"
+        "اللي هتضيفه بيظهر <b>قبل السؤال ده</b> لما الطالب يبدأ المحاضرة."
+    )
+    rows = [
+        [InlineKeyboardButton(f"📝 {'Replace' if case else 'Add'} case study", callback_data=f"eqattc:{idx}")],
+        [InlineKeyboardButton(f"🖼 {'Replace' if image else 'Add'} image", callback_data=f"eqatti:{idx}")],
+    ]
+    if case:
+        rows.append([InlineKeyboardButton("🗑 Remove case study", callback_data=f"eqattxc:{idx}")])
+    if image:
+        rows.append([InlineKeyboardButton("🗑 Remove image", callback_data=f"eqattxi:{idx}")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للسؤال", callback_data=f"eqq:{idx}")])
+    return None, text, InlineKeyboardMarkup(rows)
+
+async def _apply_eq_attach(context: ContextTypes.DEFAULT_TYPE, pending: dict, *, text: str | None = None,
+                           photo=None, spoiler: bool = False) -> str | None:
+    """Saves a case study (text) or image (photo = a Telegram PhotoSize) onto
+    the existing question pending["mid"], replacing any earlier one of the
+    same kind. Images are reposted into the year's channel first so we keep
+    that permanent copy's file_id (same durability trick as
+    _capture_add_lecture_poll; falls back to the admin's own upload if the
+    channel post fails). Returns an error string, or None on success."""
+    year, mid = pending["year"], pending["mid"]
+    lecture_key, entry = _eq_att_lecture_of(year, mid)
+    if entry is None:
+        return "⚠️ السؤال ده مش موجود دلوقتي — يمكن اتشال من حتة تانية."
+    if text is not None:
+        entry["poll_case_studies"] = [c for c in (entry.get("poll_case_studies") or []) if c["mid"] != mid] + [
+            {"mid": mid, "content": text}
+        ]
+    else:
+        stored = {"file_id": photo.file_id, "file_unique_id": photo.file_unique_id, "spoiler": spoiler}
+        channel_id = year_channel_id(year)
+        if channel_id:
+            try:
+                sent = await context.bot.send_photo(chat_id=channel_id, photo=photo.file_id, has_spoiler=spoiler)
+                ch = sent.photo[-1]
+                stored = {"file_id": ch.file_id, "file_unique_id": ch.file_unique_id, "spoiler": spoiler}
+            except Exception as e:
+                print(f"EQ ATTACH channel backup post failed for {lecture_key} ({year}): {e}")
+        entry["poll_images"] = [i for i in (entry.get("poll_images") or []) if i["mid"] != mid] + [
+            {"mid": mid, **stored}
+        ]
+    await save_quiz_index(year)
+    await backup_quiz_to_channel(context, year)
+    return None
+
+def _eq_att_done_markup(pending: dict) -> InlineKeyboardMarkup:
+    idx = f"{pending['year']}:{pending['mod_idx']}:{pending['subj_idx']}:{pending['lec_idx']}:{pending['mid']}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Case / image", callback_data=f"eqatt:{idx}")],
+        [InlineKeyboardButton("🔙 رجوع للسؤال", callback_data=f"eqq:{idx}")],
+    ])
 
 async def _render_eq_edit_menu(query, year, mod_idx, subj_idx, lec_idx, mid, entry, status):
     """Draws the eqedit: submenu (question/choices/correct-choice/
@@ -8362,6 +8787,9 @@ def _eq_lecture_list_view(year, mod_idx, subj_idx, lec_idx, lecture_key, entry):
         number_buttons.append(w_row)
     total = len(all_lines)   # polls + written, for the split-in-two threshold below
 
+    number_buttons.append([InlineKeyboardButton(
+        "➕ Tail poll", callback_data=f"eqtail:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
+    )])
     if ids:
         number_buttons.append([InlineKeyboardButton(
             "🗑 اختار أكتر من سؤال للحذف", callback_data=f"eqmsstart:{year}:{mod_idx}:{subj_idx}:{lec_idx}"
@@ -8517,6 +8945,20 @@ async def _apply_eqedit(update: Update, context: ContextTypes.DEFAULT_TYPE, pend
 
 BOOKMARKS_PAGE_SIZE = 5
 
+def _mistakes_bank_menu_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Text + keyboard of the 🧠 Mistakes Bank menu. Shared by the menu
+    button and the post-clear refresh, so both always look the same."""
+    scope = get_daily_quiz_scope()
+    count = len(_scoped_mistakes_bank(user_id))
+    scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
+    text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
+    buttons = []
+    if count:
+        buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="mistakes_retake")])
+        buttons.append([InlineKeyboardButton("🗑 Clear Mistakes Bank", callback_data="clear_mistakes_bank_ask")])
+    buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    return text, InlineKeyboardMarkup(buttons)
+
 def _bookmarks_text(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
     items = list(reversed(_bookmark_list(user_id)))  # newest first
     total = len(items)
@@ -8562,6 +9004,7 @@ def _bookmarks_text(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMar
         buttons.append(nav)
     if total:
         buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="bookmarks_retake")])
+        buttons.append([InlineKeyboardButton("🗑 Clear Bookmarks", callback_data="clear_bookmarks_ask")])
     buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     return text, InlineKeyboardMarkup(buttons)
 
@@ -8749,6 +9192,7 @@ def _lecture_preview_view(
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
+@_serialize_per_user
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
@@ -8757,7 +9201,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # its own, i.e. answer(text) WITHOUT show_alert) has to be decided
     # right here rather than answered later inside the branch. See
     # _tap_toast for which taps get one.
-    await query.answer(text=_tap_toast(query.data, user_id))
+    # Toasts are now sent as a silent message that auto-deletes after
+    # TOAST_DELETE_SECONDS (8s) instead of the fading answer() banner — the
+    # tap itself is still answered bare so the button's spinner clears.
+    toast_text = _tap_toast(query.data, user_id)
+    await query.answer()
+    if toast_text:
+        toast_chat = query.message.chat_id if query.message else user_id
+        await _send_toast_message(context, toast_chat, toast_text)
 
     # ── QUESTION TIMEOUT — resume/abandon a paused session ────────────
     # Only shown after two consecutive timed-out questions in a row (see
@@ -9347,6 +9798,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # srchpage:<token>:<page> -> flips the results list to another page.
+    # srchpick:<token>:<idx>  -> resends that one match as a live quiz poll
+    #                            (the list stays so more can be picked).
+    # <token> ties the button to one specific search; a newer search, or a
+    # bot restart (SEARCH_RESULTS is in-memory), makes older lists "expired".
+    if query.data.startswith(("srchpage:", "srchpick:")):
+        prefix, token, num_str = query.data.split(":", 2)
+        chat_id = query.message.chat_id
+        state = SEARCH_RESULTS.get(chat_id)
+        if not state or state["token"] != token:
+            await _send_toast_message(context, chat_id, "⚠️ نتيجة البحث دي انتهت — ابحث تاني.")
+            return
+        num = int(num_str)
+        if prefix == "srchpage":
+            text, markup = _search_list_view(state, num)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+        if not 0 <= num < len(state["matches"]):
+            return
+        m = state["matches"][num]
+        where = f"{subject_label(m['subject'])} — {html.escape(m['lecture_name'])}"
+        await context.bot.send_message(chat_id, f"{num + 1}. {where}", parse_mode=ParseMode.HTML)
+        await deliver_quiz(
+            context, chat_id, m["question"], m["options"], m["correct_option_id"],
+            explanation=m.get("explanation"),
+        )
+        if num not in state["sent"]:
+            state["sent"].add(num)
+            _, markup = _search_list_view(state, state["page"])
+            try:
+                await query.edit_message_reply_markup(reply_markup=markup)   # ✅ on the picked number
+            except BadRequest:
+                pass
+        return
+
     if query.data.startswith("search_mod:"):
         _, year, mod_token = query.data.split(":", 2)
         if year not in YEARS or not year_channel_id(year):
@@ -9818,7 +10304,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not modules:
             await query.edit_message_text(f"📭 مفيش موديولات متظبطة لـ {year_label(year)} لسه.")
             return
-        buttons = [[InlineKeyboardButton(module_label(m), callback_data=f"eqmodule:{year}:{i}")] for i, m in enumerate(modules)]
+        buttons = [[InlineKeyboardButton("🔎 Search Questions", callback_data=f"eqsrch:{year}:all")]]
+        buttons += [[InlineKeyboardButton(module_label(m), callback_data=f"eqmodule:{year}:{i}")] for i, m in enumerate(modules)]
         buttons.append([InlineKeyboardButton("🔙 رجوع للسنين", callback_data="eqyr_root")])
         await query.edit_message_text(
             f"✏️ <b>{year_label(year)}</b> — اختار الموديول:", parse_mode=ParseMode.HTML,
@@ -9842,6 +10329,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(subject_label(s), callback_data=f"eqsubject:{year}:{mod_idx}:{i}")]
             for i, s in enumerate(subjects)
         ]
+        buttons.append([InlineKeyboardButton("🔎 Search in this module", callback_data=f"eqsrch:{year}:{mod_idx}")])
         buttons.append([InlineKeyboardButton("🔙 رجوع للموديولات", callback_data=f"eqyr:{year}")])
         await query.edit_message_text(
             f"✏️ <b>{year_label(year)} — {module}</b> — اختار المادة:", parse_mode=ParseMode.HTML,
@@ -9881,6 +10369,159 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             header, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
+        return
+
+    # ── 📎 EQ ATTACH: add / replace / remove a case study or image on an ──
+    # EXISTING question (separate from the eqedit: menu).
+    # eqatt:<idx>   -> submenu showing what the question has now
+    # eqattc:<idx>  -> arm AWAITING_EQ_ATTACH kind=case, next text message
+    # eqatti:<idx>  -> arm AWAITING_EQ_ATTACH kind=image, next photo
+    # eqattxc:/eqattxi:<idx> -> remove the case study / image
+    # where <idx> = year:mod_idx:subj_idx:lec_idx:mid (the eqq: shape).
+    if query.data.startswith(("eqatt:", "eqattc:", "eqatti:", "eqattxc:", "eqattxi:")):
+        prefix, year, mod_str, subj_str, lec_str, mid_str = query.data.split(":")
+        mod_idx, subj_idx, lec_idx, mid = int(mod_str), int(subj_str), int(lec_str), int(mid_str)
+        AWAITING_EQ_ATTACH.pop(user_id, None)   # any menu tap cancels a half-finished attach
+        err, att_text, att_markup = _eq_att_menu(year, mod_idx, subj_idx, lec_idx, mid)
+        if err:
+            await query.edit_message_text(err)
+            return
+
+        if prefix in ("eqattc", "eqatti"):
+            if ADD_LECTURE_STATE.get(user_id):
+                await query.edit_message_text("⚠️ عندك محاضرة مفتوحة للإضافة بالفعل — اقفلها (End) أو الغيها (Cancel) الأول.")
+                return
+            kind = "case" if prefix == "eqattc" else "image"
+            AWAITING_EQ_ATTACH[user_id] = {
+                "kind": kind, "year": year, "mid": mid,
+                "mod_idx": mod_idx, "subj_idx": subj_idx, "lec_idx": lec_idx,
+            }
+            ask = (
+                "📝 ابعت دلوقتي الـ <b>Case study</b> (نص) — هيتبعت قبل السؤال ده."
+                if kind == "case" else
+                "🖼 ابعت دلوقتي <b>الصورة</b> — هتظهر مع السؤال ده."
+            )
+            await query.edit_message_text(
+                f"{ask}\n(لو فيه واحد قديم هيتستبدل.)",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "❌ Cancel", callback_data=f"eqatt:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")]]),
+            )
+            return
+
+        if prefix in ("eqattxc", "eqattxi"):
+            lecture_key, entry = _eq_att_lecture_of(year, mid)
+            key = "poll_case_studies" if prefix == "eqattxc" else "poll_images"
+            if entry is not None and entry.get(key):
+                entry[key] = [x for x in entry[key] if x["mid"] != mid]
+                if not entry[key]:
+                    entry.pop(key, None)
+                await save_quiz_index(year)
+                await backup_quiz_to_channel(context, year)
+                await _send_toast_message(context, query.message.chat_id, "🗑 اتشال.")
+            err, att_text, att_markup = _eq_att_menu(year, mod_idx, subj_idx, lec_idx, mid)
+
+        await query.edit_message_text(att_text, parse_mode=ParseMode.HTML, reply_markup=att_markup)
+        return
+
+    # ── 🔎 EQ SEARCH ─────────────────────────────────────────────────
+    # eqsrch:<year>:<mod_idx|all>  -> arms AWAITING_EQ_SEARCH, asks for text
+    # eqsrchpage:<token>:<page>    -> flips the results list
+    # eqsrchpick:<token>:<mid>     -> preview of one hit: Delete / Edit / back
+    # eqsrchdel:<token>:<mid>      -> removes it (same effect as eqdel:) and
+    #                                 lands back on the results list
+    # <token> ties buttons to one specific search; a newer search or a bot
+    # restart (in-memory state) makes older lists read as expired. All of
+    # these start with "eq", so the admin + year gate above covers them.
+    if query.data.startswith("eqsrch:"):
+        _, year, mod_token = query.data.split(":")
+        if year not in YEARS or not year_channel_id(year):
+            await query.edit_message_text("⚠️ السنة دي مش متاحة دلوقتي.")
+            return
+        mod_idx = None if mod_token == "all" else int(mod_token)
+        if mod_idx is not None and mod_idx >= len(ready_modules(year)):
+            await query.edit_message_text("⚠️ الموديول ده مش موجود دلوقتي.")
+            return
+        AWAITING_EQ_SEARCH[user_id] = {"year": year, "mod_idx": mod_idx}
+        back = f"eqyr:{year}" if mod_idx is None else f"eqmodule:{year}:{mod_idx}"
+        await query.edit_message_text(
+            f"🔎 <b>Search Questions</b>\n✏️ 📚 {_eq_search_scope(year, mod_idx)}\n\n"
+            "اكتب كلمة أو جزء من السؤال (أو من الاختيارات) وهجيبلك كل الأسئلة المطابقة.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=back)]]),
+        )
+        return
+
+    if query.data.startswith(("eqsrchpage:", "eqsrchpick:", "eqsrchdel:")):
+        prefix, token, num_str = query.data.split(":")
+        chat_id = query.message.chat_id
+        state = EQ_SEARCH_RESULTS.get(user_id)
+        if not state or state["token"] != token:
+            await _send_toast_message(context, chat_id, "⚠️ نتيجة البحث دي انتهت — ابحث تاني.")
+            return
+        year = state["year"]
+        if not can_edit_year(update, year):
+            await query.edit_message_text(_wrong_year_msg(update))
+            return
+        num = int(num_str)
+
+        if prefix == "eqsrchpage":
+            text, markup = _eq_search_list_view(state, num)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        m = next((x for x in state["matches"] if x["mid"] == num), None)
+        lecture_key = next(
+            (k for k, v in QUIZ_INDEX[year].items() if num in v["ids"]), None
+        ) if m else None
+        if not m or lecture_key is None:
+            # Gone since the search (deleted elsewhere) — drop it and refresh the list.
+            state["matches"] = [x for x in state["matches"] if x["mid"] != num]
+            await _send_toast_message(context, chat_id, "⚠️ السؤال ده مش موجود دلوقتي.")
+            if state["matches"]:
+                text, markup = _eq_search_list_view(state, state["page"])
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            else:
+                await query.edit_message_text("📭 مفيش نتايج تانية.", reply_markup=_eq_search_back_markup(year, state["mod_idx"]))
+            return
+
+        if prefix == "eqsrchpick":
+            status = _poll_status_index(year).get(num) or {}
+            options = status.get("options") or []
+            correct = status.get("correct_option_id")
+            opts_text = "\n".join(
+                f"{string.ascii_uppercase[i]}) {'✅ ' if i == correct else ''}{o}" for i, o in enumerate(options)
+            )
+            idx = f"{year}:{m['mod_idx']}:{m['subj_idx']}:{m['lec_idx']}:{num}"
+            await query.edit_message_text(
+                f"✏️ <b>{html.escape(m['lecture_name'])}</b> — {subject_label(m['subject'])}\n\n"
+                f"❓ {html.escape(m['question'])}\n\n{html.escape(opts_text)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqsrchdel:{token}:{num}")],
+                    [InlineKeyboardButton("✏️ Edit this poll", callback_data=f"eqedit:{idx}")],
+                    [InlineKeyboardButton("📎 Add case / image", callback_data=f"eqatt:{idx}")],
+                    [InlineKeyboardButton("🔙 رجوع للنتائج", callback_data=f"eqsrchpage:{token}:{state['page']}")],
+                ]),
+            )
+            return
+
+        # eqsrchdel — same steps as eqdel: (channel message itself is left alone)
+        QUIZ_INDEX[year][lecture_key]["ids"].remove(num)
+        await save_quiz_index(year)
+        for pid in [pid for pid, v in QUIZ_POLL_STATUS[year].items() if v["message_id"] == num]:
+            QUIZ_POLL_STATUS[year].pop(pid, None)
+        await save_quiz_poll_status(year)
+        await backup_quiz_to_channel(context, year)
+        state["matches"] = [x for x in state["matches"] if x["mid"] != num]
+        await _send_toast_message(context, chat_id, "🗑 اتشال السؤال (الرسالة لسه في القناة — احذفها يدوي لو عايز)")
+        if state["matches"]:
+            text, markup = _eq_search_list_view(state, state["page"])
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            await query.edit_message_text(
+                "📭 مفيش نتايج تانية.", reply_markup=_eq_search_back_markup(year, state["mod_idx"]),
+            )
         return
 
     # ── EQLECTURE: list this lecture's questions (split across two
@@ -9963,6 +10604,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = [
             [InlineKeyboardButton("✏️ Edit this poll", callback_data=f"eqedit:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
+            [InlineKeyboardButton("📎 Add case / image", callback_data=f"eqatt:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("🗑 Delete this poll", callback_data=f"eqdel:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("➕ Insert new poll after", callback_data=f"eqins:{year}:{mod_idx}:{subj_idx}:{lec_idx}:{mid}")],
             [InlineKeyboardButton("🔙 رجوع للأسئلة", callback_data=f"eqlecture:{year}:{mod_idx}:{subj_idx}:{lec_idx}")],
@@ -10082,14 +10724,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # with the new polls spliced in right after the chosen question
     # instead of appended at the end (al_state["insert_after"], advanced
     # to each newly inserted mid — see _capture_add_lecture_poll).
-    if query.data.startswith("eqins:"):
-        _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
-        mod_idx, subj_idx, lec_idx, target_mid = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str), int(mid_str)
+    # eqtail: is the same session without a target question — new polls are
+    # appended at the END (tail) of the lecture instead of spliced in after
+    # one (al_state["insert_after"] stays None, which _capture_add_lecture_poll
+    # treats as "append"). Either way, an image / case study sent right before
+    # a forwarded poll binds to that poll and shows before it.
+    if query.data.startswith(("eqins:", "eqtail:")):
+        is_tail = query.data.startswith("eqtail:")
+        if is_tail:
+            _, year, mod_idx_str, subj_idx_str, lec_idx_str = query.data.split(":")
+            target_mid = None
+        else:
+            _, year, mod_idx_str, subj_idx_str, lec_idx_str, mid_str = query.data.split(":")
+            target_mid = int(mid_str)
+        mod_idx, subj_idx, lec_idx = int(mod_idx_str), int(subj_idx_str), int(lec_idx_str)
         err, entry, lecture_key, ids = _eq_resolve_lecture(year, mod_idx, subj_idx, lec_idx)
         if err:
             await query.edit_message_text(err)
             return
-        if target_mid not in ids:
+        if target_mid is not None and target_mid not in ids:
             await query.edit_message_text("⚠️ السؤال ده مش موجود دلوقتي — يمكن اتعدل من حتة تانية.")
             return
         if ADD_LECTURE_STATE.get(user_id):
@@ -10113,12 +10766,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "existed_before": True, "was_closed_before": was_closed_before,
             "session_ids": [], "session_written_ids": [],
             "status_message_id": None, "pending_image": None, "pending_case_study": None,
-            "insert_after": target_mid,   # new polls splice in after this mid, one after another
+            "insert_after": target_mid,   # new polls splice in after this mid, one after another (None = append at the tail)
         }
+        where_line = (
+            "هتتضاف في آخر المحاضرة (Tail)، بالترتيب اللي هتبعتهم بيه."
+            if is_tail else
+            "هتتحط بعد السؤال اللي اخترته على طول، بالترتيب اللي هتبعتهم بيه."
+        )
         await query.edit_message_text(
             f"➕ <b>{entry['name']}</b> اتفتحت للإضافة.\n\n"
             "دلوقتي فوروارد الأسئلة (Quiz polls) واحد واحد، وشيل اسم المرسل من كل واحدة "
-            "(Hide Sender's Name) — هتتحط بعد السؤال اللي اخترته على طول، بالترتيب اللي هتبعتهم بيه.\n"
+            f"(Hide Sender's Name) — {where_line}\n"
             "لو عايز تضيف صورة أو Case study (نص) لسؤال معين، ابعتها الأول وبعدين فوروارد السؤال. "
             "وتقدر تبعت سؤال مكتوب وإجابته مخفية بـ Spoiler زي /add_lecture بالظبط.\n"
             "لما تخلص دوس End Lecture (أو ابعت <code>-END</code>).",
@@ -10433,6 +11091,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_bookmarks(context, user_id, query.message, edit=True, page=1)
         return
 
+    # ── Bookmarks: Clear Bookmarks (with confirmation) ──
+    # Clears every ❤️ bookmark of the tapping user only (bookmarks aren't
+    # scoped by /daily_module). Confirm screen count == toast count ==
+    # what gets removed. Mistakes-bank entries are never touched.
+    if query.data == "clear_bookmarks_ask":
+        count = len(_bookmark_entries(user_id))
+        if not count:
+            return   # "already empty" toast was shown by _tap_toast
+        await query.edit_message_text(
+            f"⚠️ <b>متأكد إنك عايز تمسح كل الـ Bookmarks بتاعتك؟</b>\n\n"
+            f"هيتمسح <b>{count}</b> سؤال، والعملية دي مش هترجع تاني.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="clear_bookmarks_yes")],
+                [InlineKeyboardButton("🔙 لأ، رجّعني", callback_data="menu_bookmarks")],
+            ]),
+        )
+        return
+
+    if query.data == "clear_bookmarks_yes":
+        _clear_user_bookmarks(user_id)
+        await save_mistakes_bank()
+        await backup_mistakes_bank_to_channel(context)
+        await _send_bookmarks(context, user_id, query.message, edit=True, page=1)
+        return
+
     if query.data.startswith("bookmarks_page:"):
         page = int(query.data.split(":", 1)[1])
         await _send_bookmarks(context, user_id, query.message, edit=True, page=page)
@@ -10528,6 +11212,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _maybe_award_curious(context, user_id)
         return
 
+    # ── settings_year / setyc: — change Year/Class from Settings ──────
+    # Only rewrites SETTINGS[uid]["year_class"]; mistakes/bookmarks keep
+    # their own stored quiz year, stats aren't year-keyed, and
+    # daily_quiz_last_date is per user, so nothing else needs migrating.
+    if query.data == "settings_year":
+        current = get_year_class(user_id)
+        rows = list(year_class_keyboard("setyc").inline_keyboard)
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")])
+        await query.edit_message_text(
+            f"📚 <b>غيّر سنتك/فرقتك</b>\n\n"
+            f"دلوقتي: <b>{html.escape(year_class_label(current))}</b>\n"
+            "اختار السنة الجديدة:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if query.data.startswith("setyc:"):
+        year_class = query.data.split(":", 1)[1]
+        if year_class not in YEAR_CLASS_NUMBER:
+            await query.edit_message_text("⚠️ الاختيار ده مش متاح.")
+            return
+        entry = _get_settings_entry(user_id)
+        if entry.get("year_class") != year_class:
+            entry["year_class"] = year_class
+            await save_settings()
+            await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
     if query.data == "edit_nickname":
         AWAITING_NICKNAME[user_id] = True
         await query.edit_message_text(
@@ -10542,7 +11256,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── onboard_yc: / dqyc: — year/class picker tap, from onboarding ──
     # (right after the first-ever nickname save) or from the Daily Quiz
     # hub prompting for it first — year/class is set once here and can't
-    # be changed afterwards (no Settings edit path anymore).
+    # be changed later from Settings -> Change Year (settings_year / setyc:).
     if query.data.startswith("onboard_yc:") or query.data.startswith("dqyc:"):
         prefix, year_class = query.data.split(":")
         is_onboarding = (prefix == "onboard_yc")
@@ -10662,7 +11376,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _maybe_award_curious(context, user_id)
         return
 
-    # ── Settings: Clear Mistake Bank (with confirmation) ──
+    # ── Mistakes Bank menu: Clear Mistakes Bank (with confirmation) ──
     # MISTAKES_BANK holds every user's entries in one file, but each entry
     # is tagged with its owner (see MISTAKES BANK schema note), so this
     # action only ever touches the tapping user's own entries — and, when
@@ -10686,7 +11400,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="clear_mistakes_bank_yes")],
-                [InlineKeyboardButton("🔙 لأ، رجّعني", callback_data="menu_settings")],
+                [InlineKeyboardButton("🔙 لأ، رجّعني", callback_data="mistakes_bank_menu")],
             ]),
         )
         return
@@ -10710,7 +11424,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await backup_mistakes_bank_to_channel(context)
         # ("✅ N cleared" toast was shown by _tap_toast, which counts this
         # same set of entries before they're removed here.)
-        await _send_settings(context, user_id, query.message, edit=True)
+        text, markup = _mistakes_bank_menu_view(user_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
     # ── /quiz_delete confirmation (admin) ────────────────────────────
@@ -10810,17 +11525,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🧠 Mistakes Bank menu button ──────────────────────────────
     if query.data == "mistakes_bank_menu":
-        scope = get_daily_quiz_scope()
-        count = len(_scoped_mistakes_bank(user_id))
         # The Quizzy toast for an empty / very full bank was already shown
         # by _tap_toast at the top of button_handler.
-        scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
-        text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
-        buttons = []
-        if count:
-            buttons.append([InlineKeyboardButton("🔁 Retake Questions", callback_data="mistakes_retake")])
-        buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        text, markup = _mistakes_bank_menu_view(user_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
     if query.data == "mistakes_retake":
@@ -11217,6 +11925,10 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         was_doing_something = True
     if AWAITING_SEARCH_QUERY.pop(user_id, None) is not None:
         was_doing_something = True
+    if AWAITING_EQ_SEARCH.pop(update.effective_user.id, None) is not None:
+        was_doing_something = True
+    if AWAITING_EQ_ATTACH.pop(update.effective_user.id, None) is not None:
+        was_doing_something = True
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
     else:
@@ -11453,9 +12165,9 @@ def _build_previewtxt_sections() -> list[str]:
         "── MAIN MENU / SETTINGS BUTTON LABELS ──\n\n"
         "Main menu: 🦦 How To Use · Quizzes ⁉️ · 📊 My Stats · ⚙️ Settings · "
         "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard\n\n"
-        "Settings (page 1): ✏️ Edit Nickname · ⏭️ Auto-Next · 🔀 Randomize · "
+        "Settings (page 1): ✏️ Edit Nickname · 📚 Change Year · ⏭️ Auto-Next · 🔀 Randomize · "
         "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
-        "🗑 Clear Mistake Bank · ➡️ More Settings · 🏠 Back to Home\n\n"
+        "➡️ More Settings · 🏠 Back to Home\n\n"
         "Settings (page 2): 🎭 Reactions · 🏆 Achievement Alerts · "
         "🔔 Daily Notification · 📿 Zikr · ⬅️ Back · 🏠 Back to Home\n\n"
         "── HOW TO USE ──\n\n" + HOW_TO_USE_TEXT
@@ -11718,9 +12430,9 @@ async def dev_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_year_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /set_year <Nickname or ID> — looks the person up, then shows
     the same year/class picker used at onboarding so the admin can set or
-    correct their Year/Class. Normally a user's year_class is locked once
-    set during onboarding (no Settings edit path) — this command is the
-    deliberate admin override for fixing a wrong pick. Also reachable via
+    correct their Year/Class. Users can also change their own year from
+    Settings -> Change Year — this command is the admin override for
+    fixing someone else's pick. Also reachable via
     the Dev Panel's 🔢 Set year button (see AWAITING_DEVPANEL_SETYEAR)."""
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
