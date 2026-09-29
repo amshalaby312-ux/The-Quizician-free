@@ -8239,8 +8239,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _flow_onboarding_message(
                 update, context, real_uid,
                 f"{quizzy_block(QUIZZY_HAPPY_ART, f'What a lovely name Dr.{nickname} 🥰')}\n\n"
-                "What Year/Class are you currently in?\n\n"
-                "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
+                "What Year/Class are you currently in?\n\n",
                 parse_mode=ParseMode.HTML,
                 reply_markup=year_class_keyboard("onboard_yc"),
             )
@@ -9741,7 +9740,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.<nickname> 🥰')}\n\n"
             "What Year/Class are you currently in?\n\n"
-            "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
             "<i>🔍 Preview — the buttons above are just a mock-up here, they don't set anything.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=preview_kb,
@@ -12178,8 +12176,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # step instead of the main menu. Also mandatory, also permanent.
         await update.message.reply_text(
             f"{quizzy_block(QUIZZY_HAPPY_ART, 'What a lovely name Dr.' + nickname + ' 🥰')}\n\n"
-            "What Year/Class are you currently in?\n\n"
-            "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)",
+            "What Year/Class are you currently in?\n\n",
             parse_mode=ParseMode.HTML,
             reply_markup=year_class_keyboard("onboard_yc"),
         )
@@ -12295,7 +12292,6 @@ def _build_previewtxt_sections() -> list[str]:
         + "\n\n[Year/Class prompt]\n"
         + quizzy_block(QUIZZY_HAPPY_ART, "What a lovely name Dr.<nickname> 🥰")
         + "\n\nWhat Year/Class are you currently in?\n\n"
-        "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
         "[Year/Class confirmed → bully joke]\n"
         + quizzy_block(QUIZZY_HAPPY_ART, "Do you want me to bully you when you get questions wrong?")
         + "\n  buttons: What??? / No 😭\n\n"
