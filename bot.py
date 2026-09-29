@@ -906,6 +906,9 @@ def _blank_entry() -> dict:
         "lecture_questions_answered":   0,
         "lecture_questions_correct":    0,
         "lecture_questions_incorrect":  0,
+        "weekly_week":                  None, # start date (YYYY-MM-DD, Friday) of the week the two
+        "weekly_correct":               0,    # counters below belong to — see _record_weekly_answer.
+        "weekly_incorrect":             0,    # They reset lazily the first time a new week is seen.
         "lecture_time_spent_seconds":   0.0,  # cumulative time-to-answer across every
                                                # lecture question ever answered, timed
                                                # question-delivered -> question-answered
@@ -1193,6 +1196,83 @@ def _year_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
             "name":     get_nickname(uid) or entry.get("telegram_name") or f"مستخدم #{uid % 10000}",
             "correct":  correct,
             "accuracy": accuracy,
+        })
+    rows.sort(key=lambda r: (-r["correct"], -r["accuracy"]))
+    return rows[:limit]
+
+# ── Weekly leaderboard ─────────────────────────────────────────────
+# Same ranking rule as the global board (correct answers first, accuracy as
+# the tiebreaker), but counting only answers given since the last reset.
+# The week runs Friday 00:00 -> next Friday 00:00 (the midnight between
+# Thursday and Friday) in DAILY_QUIZ_TZ (Cairo). No scheduled job: each
+# analytics entry remembers which week its weekly_* counters belong to
+# ("weekly_week" = that week's Friday date); the first answer recorded in a
+# new week zeroes them, and the leaderboard ignores anyone whose counters
+# still belong to an older week. Answers are counted at exactly the same
+# four places lecture_questions_correct/incorrect are (lecture, Daily Quiz,
+# Mistakes retake, Bookmarks retake) via _record_weekly_answer.
+WEEKLY_RESET_WEEKDAY = 4   # Monday=0 ... Friday=4
+
+def _weekly_window(now: datetime | None = None) -> tuple[str, datetime]:
+    """(week_key, next_reset) for `now` (default: right now, Cairo time).
+    week_key is the current week's Friday date as YYYY-MM-DD."""
+    now = now or datetime.now(DAILY_QUIZ_TZ)
+    days_since = (now.weekday() - WEEKLY_RESET_WEEKDAY) % 7
+    start = (now - timedelta(days=days_since)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.date().isoformat(), start + timedelta(days=7)
+
+def _record_weekly_answer(entry: dict, is_correct: bool) -> None:
+    """Counts one answered question toward this user's current week."""
+    week, _ = _weekly_window()
+    if entry.get("weekly_week") != week:
+        entry["weekly_week"]      = week
+        entry["weekly_correct"]   = 0
+        entry["weekly_incorrect"] = 0
+    if is_correct:
+        entry["weekly_correct"] = entry.get("weekly_correct", 0) + 1
+    else:
+        entry["weekly_incorrect"] = entry.get("weekly_incorrect", 0) + 1
+
+def _weekly_reset_countdown() -> str:
+    """'3 يوم و 5 ساعة' style time left until the next Friday-midnight reset."""
+    now = datetime.now(DAILY_QUIZ_TZ)
+    _, next_reset = _weekly_window(now)
+    secs = max(0, int(next_reset.timestamp() - now.timestamp()))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days} يوم و {hours} ساعة"
+    if hours:
+        return f"{hours} ساعة و {minutes} دقيقة"
+    return f"{max(minutes, 1)} دقيقة"
+
+def _weekly_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
+    """Top users of one Year/Class cohort this week, ranked by this week's
+    correct answers (then accuracy). Each row also carries the user's
+    current level and level title for display."""
+    week, _ = _weekly_window()
+    rows = []
+    for uid_str, entry in ANALYTICS.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue
+        uid = int(uid_str)
+        if get_year_class(uid) != year_class:
+            continue
+        if entry.get("weekly_week") != week:
+            continue   # last counted in an older week — effectively reset
+        correct = entry.get("weekly_correct", 0)
+        if correct <= 0:
+            continue
+        answered = correct + entry.get("weekly_incorrect", 0)
+        level = entry.get("level", 0)
+        rows.append({
+            "user_id":  uid,
+            "name":     get_nickname(uid) or entry.get("telegram_name") or f"مستخدم #{uid % 10000}",
+            "correct":  correct,
+            "accuracy": (correct / answered * 100) if answered else 0.0,
+            "level":    level,
+            "title":    _level_title(level),
         })
     rows.sort(key=lambda r: (-r["correct"], -r["accuracy"]))
     return rows[:limit]
@@ -3045,6 +3125,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
     _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
@@ -3478,6 +3559,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
     _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
@@ -3636,6 +3718,7 @@ async def _advance_bookmarks_retake_session(context: ContextTypes.DEFAULT_TYPE, 
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
     _record_subject_answer(user_entry, session.get("current_module"), session.get("current_subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
@@ -5443,7 +5526,13 @@ def start_menu_keyboard():
             InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
         ],
         [
-            InlineKeyboardButton("🏆 Leaderboard", callback_data="year_leaderboard"),
+            InlineKeyboardButton("📅 Weekly Leaderboard", callback_data="weekly_leaderboard"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Global Leaderboard", callback_data="year_leaderboard"),
+        ],
+        [
+            InlineKeyboardButton("🔥COMING SOON🔥", callback_data="coming_soon"),
         ],
     ])
 
@@ -6617,6 +6706,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     user_entry["lecture_questions_answered"]  += 1
     user_entry["lecture_questions_correct"]   += 1 if is_correct else 0
     user_entry["lecture_questions_incorrect"] += 0 if is_correct else 1
+    _record_weekly_answer(user_entry, is_correct)
     _record_subject_answer(user_entry, session.get("module"), session.get("subject"), is_correct)
     if is_correct:
         user_entry["lecture_correct_streak_current"] += 1
@@ -8011,7 +8101,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             return
         draft = BROADCAST_DRAFTS.setdefault(real_uid, {"audience": "all", "text": None})
-        draft["text"] = text
+        # Use the untouched message text (not the stripped `text`) so the
+        # entity offsets line up, then convert its formatting to HTML.
+        draft["text"] = _broadcast_text_from_message(update.message.text, update.message.entities)
         draft["media"] = None   # a typed message replaces any attachment set earlier
         body, markup = _broadcast_composer_view(real_uid)
         await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -8353,6 +8445,7 @@ TOAST_SR_NEEDS_AUTO_NEXT   = "⚠️ Spaced Repetition لازم يكون معا�
 TOAST_AUTO_NEXT_OFF_SR     = "⚠️ قفلت Auto-Next، فـ Spaced Repetition مش هيشتغل لحد ما ترجعه"
 TOAST_BANK_ALREADY_EMPTY   = "🎉 بنك الأخطاء بتاعك فاضي أصلاً!"
 TOAST_BOOKMARKS_ALREADY_EMPTY = "مفيش أسئلة محفوظة أصلاً! ❤️"
+TOAST_COMING_SOON        = "ما تصبر على رزقك يا ضاكتور الله"
 TOAST_REPORT_CLOSED        = "⚠️ الـ report ده اتقفل، مينفعش ترد عليه تاني."
 TOAST_REPORT_NOT_YOURS     = "⚠️ مش قادر أعمل كده."
 QUIZZY_MISTAKES_HIGH_THRESHOLD = 10   # mistake count at/above which the bench-press jab fires
@@ -8397,8 +8490,8 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
         if data.startswith("onboard_yc:"):
             quip = ONBOARDING_YEAR_QUIPS.get(data.split(":", 1)[1])
             return f"🐱 {quip}" if quip else None
-        if data == "onboard_go":
-            return "🐱 " + random.choice(QUIZZY_WELCOME_LINES)
+        # (onboard_go — "يلا بينا" — has no toast: it now just sends the
+        # same welcome menu /start does, Quizzy's line included.)
 
         # ── Daily Quiz: "already done today" outranks the late-night nudge —
         # the one place that race surfaces is a stale Start button tapped
@@ -8446,6 +8539,10 @@ def _tap_toast(callback_data: str | None, user_id: int) -> str | None:
             # counted — so count that same set.
             cleared = len(_scoped_mistakes_bank(user_id))
             return f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك."
+
+        # ── Main menu: 🔥COMING SOON🔥 (toast only, nothing else happens) ──
+        if data == "coming_soon":
+            return TOAST_COMING_SOON
 
         # ── Bookmarks: Clear Bookmarks ──
         if data == "clear_bookmarks_ask":
@@ -9210,6 +9307,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         toast_chat = query.message.chat_id if query.message else user_id
         await _send_toast_message(context, toast_chat, toast_text)
 
+    # 🔥COMING SOON🔥 — the toast above is the whole feature; leave the menu as is.
+    if query.data == "coming_soon":
+        return
+
     # ── QUESTION TIMEOUT — resume/abandon a paused session ────────────
     # Only shown after two consecutive timed-out questions in a row (see
     # _handle_question_timeout / QUESTION TIMEOUT section above).
@@ -9262,7 +9363,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             AWAITING_BROADCAST_MESSAGE[user_id] = True
             await query.edit_message_text(
                 "✏️ ابعت نص الرسالة اللي عايز تبثها دلوقتي — أو أي مرفق (صورة/فيديو/ملف/صوت/ستيكر...) وهيتبعت زي ما هو.\n"
-                "HTML بسيط متاح للنص: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;code&gt;</code>...",
+                "التنسيق (Bold / Italic / Spoiler / Link...) اللي تعمله في الرسالة هيتبعت زي ما هو. "
+                "ولو النص من غير تنسيق تقدر تكتب HTML بسيط: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;tg-spoiler&gt;</code>...",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bcmsgcancel")]]),
             )
@@ -11134,6 +11236,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_info_page(context, query, TERMS_OF_SERVICE_TEXT, "Terms of Service")
         return
 
+    if query.data == "weekly_leaderboard" or query.data.startswith("weekly_leaderboard:"):
+        # Weekly board: this week's correct answers only (resets every
+        # Friday 00:00 Cairo time — see _weekly_window), same cohort filter
+        # and paging as the global board, plus each user's current level
+        # and level title.
+        page = 1
+        if query.data.startswith("weekly_leaderboard:"):
+            page = int(query.data.split(":")[1])
+        year_class = get_year_class(user_id)
+        rows = _weekly_leaderboard(year_class)
+        title = f"📅 <b>Weekly Leaderboard — {year_class_label(year_class)}</b>"
+        reset_line = f"⏳ بيتصفّر كل جمعة 12 بالليل — فاضل {_weekly_reset_countdown()}"
+        if not rows:
+            text = f"{title}\n{reset_line}\n\nمفيش حد جاوب أسئلة الأسبوع ده لسه — كن أول واحد! 🔥"
+            nav_buttons = []
+        else:
+            page_size   = YEAR_LEADERBOARD_PAGE_SIZE
+            total_pages = (len(rows) + page_size - 1) // page_size
+            page        = max(1, min(page, total_pages))
+            start       = (page - 1) * page_size
+            page_rows   = rows[start:start + page_size]
+
+            lines = [title, reset_line, ""]
+            for i, r in enumerate(page_rows, start + 1):
+                lines.append(
+                    f"{i}# {html.escape(r['name'])} — {r['correct']} ✅ · {r['accuracy']:.0f}% دقة"
+                )
+                lines.append(f"      ⭐ Lv {r['level']} · <i>{html.escape(r['title'])}</i>")
+            text = "\n".join(lines)
+
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"weekly_leaderboard:{page - 1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"weekly_leaderboard:{page + 1}"))
+
+        keyboard_rows = ([nav_buttons] if nav_buttons else []) + [
+            [InlineKeyboardButton("🏆 Global Leaderboard", callback_data="year_leaderboard")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+        return
+
     if query.data == "year_leaderboard" or query.data.startswith("year_leaderboard:"):
         # year_class is guaranteed set by this point — mandatory onboarding
         # (see _onboarding_gate) means no update reaches here otherwise.
@@ -11168,9 +11316,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if page < total_pages:
                 nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"year_leaderboard:{page + 1}"))
 
-        keyboard_rows = ([nav_buttons] if nav_buttons else []) + [[
-            InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
-        ]]
+        keyboard_rows = ([nav_buttons] if nav_buttons else []) + [
+            [InlineKeyboardButton("📅 Weekly Leaderboard", callback_data="weekly_leaderboard")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+        ]
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
@@ -11329,13 +11478,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
 
-        # The random Quizzy welcome line already showed as a toast on this
-        # tap (see _tap_toast), so the menu message itself is just
-        # the greeting — no ASCII cat block repeated underneath it.
-        nickname = get_nickname(user_id)
-        greeting = f"يا {html.escape(nickname)}! " if nickname else ""
-        await query.edit_message_text(
-            f"{greeting}تحب تعمل أي؟!:",
+        # Same as a plain /start: a fresh welcome-menu message (Quizzy's
+        # line included — no toast anymore). The welcome-tour message
+        # above it stays readable; only its "يلا بينا" button is removed
+        # so it can't be tapped a second time.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=_welcome_menu_text(get_nickname(user_id)),
             parse_mode=ParseMode.HTML,
             reply_markup=start_menu_keyboard(),
         )
@@ -12043,13 +12196,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
             return
 
-    greeting = f"يا {html.escape(nickname)}! "
-
     await update.message.reply_text(
-        f"{quizzy_block(QUIZZY_HAPPY_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-        f"{greeting}تحب تعمل أي؟!:",
+        _welcome_menu_text(nickname),
         parse_mode=ParseMode.HTML,
         reply_markup=start_menu_keyboard(),
+    )
+
+def _welcome_menu_text(nickname: str | None) -> str:
+    """The main-menu greeting /start sends (Quizzy art + a random welcome
+    line + "تحب تعمل أي؟!"). Shared by start() and the end-of-onboarding
+    "يلا بينا" button so the two always look identical."""
+    greeting = f"يا {html.escape(nickname)}! " if nickname else ""
+    return (
+        f"{quizzy_block(QUIZZY_HAPPY_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+        f"{greeting}تحب تعمل أي؟!:"
     )
 
 async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -12164,7 +12324,7 @@ def _build_previewtxt_sections() -> list[str]:
     out.append(
         "── MAIN MENU / SETTINGS BUTTON LABELS ──\n\n"
         "Main menu: 🦦 How To Use · Quizzes ⁉️ · 📊 My Stats · ⚙️ Settings · "
-        "💥Daily Quiz💥 · 🧠 Mistakes Bank · 🏆 Leaderboard\n\n"
+        "💥Daily Quiz💥 · 🧠 Mistakes Bank · 📅 Weekly Leaderboard · 🏆 Global Leaderboard · 🔥COMING SOON🔥\n\n"
         "Settings (page 1): ✏️ Edit Nickname · 📚 Change Year · ⏭️ Auto-Next · 🔀 Randomize · "
         "🔀 Mix Written · 🔁 Spaced Repetition · ⏱️ Question Timer · "
         "➡️ More Settings · 🏠 Back to Home\n\n"
@@ -12756,6 +12916,104 @@ def _broadcast_composer_view(admin_id: int) -> tuple:
 
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
+# ── Formatting-preserving broadcast text ──────────────────────────
+# A text message's bold/italic/spoiler/etc. never lives in message.text —
+# Telegram sends it separately as entities (UTF-16 offsets), which is why
+# the old code (message.text / context.args) silently dropped it. Draft
+# text is sent with parse_mode=HTML, so the entities are converted back
+# into HTML tags here. A message with NO formatting entities is passed
+# through untouched, which keeps the old "type raw <b>…</b> yourself"
+# behavior working exactly as before.
+_BROADCAST_FORMAT_ENTITY_TYPES = {
+    "bold", "italic", "underline", "strikethrough", "spoiler", "code", "pre",
+    "text_link", "text_mention", "blockquote", "expandable_blockquote", "custom_emoji",
+}
+
+def _entity_html_tags(e) -> tuple | None:
+    """(open_tag, close_tag) for one MessageEntity, or None if it isn't a
+    formatting entity (url/mention/hashtag/... need no tag — Telegram
+    re-detects those from the plain text on its own)."""
+    t = str(getattr(e, "type", ""))
+    if t == "bold":          return "<b>", "</b>"
+    if t == "italic":        return "<i>", "</i>"
+    if t == "underline":     return "<u>", "</u>"
+    if t == "strikethrough": return "<s>", "</s>"
+    if t == "spoiler":       return "<tg-spoiler>", "</tg-spoiler>"
+    if t == "code":          return "<code>", "</code>"
+    if t == "blockquote":    return "<blockquote>", "</blockquote>"
+    if t == "expandable_blockquote": return "<blockquote expandable>", "</blockquote>"
+    if t == "pre":
+        lang = getattr(e, "language", None)
+        if lang:
+            return f'<pre><code class="language-{html.escape(lang, quote=True)}">', "</code></pre>"
+        return "<pre>", "</pre>"
+    if t == "text_link" and getattr(e, "url", None):
+        return f'<a href="{html.escape(e.url, quote=True)}">', "</a>"
+    if t == "text_mention" and getattr(e, "user", None):
+        return f'<a href="tg://user?id={e.user.id}">', "</a>"
+    if t == "custom_emoji" and getattr(e, "custom_emoji_id", None):
+        return f'<tg-emoji emoji-id="{html.escape(str(e.custom_emoji_id), quote=True)}">', "</tg-emoji>"
+    return None
+
+def _entities_to_html(text: str, entities, cut_chars: int = 0) -> str:
+    """Rebuilds `text[cut_chars:]` as Telegram-HTML, re-applying `entities`
+    (offsets/lengths in UTF-16 code units, as Telegram sends them).
+    Entities that start before the cut (e.g. the /broadcast command
+    itself) are dropped. Overlapping entities that don't nest cleanly are
+    closed and re-opened so the HTML stays valid."""
+    units = text.encode("utf-16-le")
+    total = len(units) // 2
+    cut   = len(text[:cut_chars].encode("utf-16-le")) // 2
+
+    spans = []   # (start, end, open_tag, close_tag)
+    for e in entities or []:
+        tags = _entity_html_tags(e)
+        if not tags:
+            continue
+        start, end = e.offset, min(e.offset + e.length, total)
+        if start < cut or end <= start:
+            continue
+        spans.append((start, end, tags[0], tags[1]))
+    spans.sort(key=lambda sp: (sp[0], -sp[1]))   # outer (longer) entity opens first
+
+    def _seg(a: int, b: int) -> str:
+        return html.escape(units[2 * a:2 * b].decode("utf-16-le"), quote=False)
+
+    points = sorted({cut, total} | {sp[0] for sp in spans} | {sp[1] for sp in spans})
+    out, stack = [], []
+    for i, pt in enumerate(points):
+        ending = {id(sp) for sp in stack if sp[1] <= pt}
+        if ending:
+            low    = min(k for k, sp in enumerate(stack) if id(sp) in ending)
+            popped = stack[low:]
+            del stack[low:]
+            for sp in reversed(popped):
+                out.append(sp[3])
+            for sp in popped:              # still-open ones that were sitting above a closed one
+                if id(sp) not in ending:
+                    out.append(sp[2])
+                    stack.append(sp)
+        for sp in spans:
+            if sp[0] == pt:
+                out.append(sp[2])
+                stack.append(sp)
+        if i + 1 < len(points):
+            out.append(_seg(pt, points[i + 1]))
+    return "".join(out)
+
+def _broadcast_text_from_message(text: str, entities, cut_chars: int = 0) -> str:
+    """Broadcast-ready HTML for `text[cut_chars:]`. Formatted text (any
+    formatting entity after the cut) is converted via _entities_to_html;
+    unformatted text is returned as-is so typed raw HTML tags keep working."""
+    cut = len(text[:cut_chars].encode("utf-16-le")) // 2
+    has_format = any(
+        str(getattr(e, "type", "")) in _BROADCAST_FORMAT_ENTITY_TYPES and e.offset >= cut
+        for e in (entities or [])
+    )
+    if not has_format:
+        return text[cut_chars:]
+    return _entities_to_html(text, entities, cut_chars)
+
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text(MSG_ADMIN_ONLY)
@@ -12774,7 +13032,16 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # captions.)
     reply     = update.message.reply_to_message
     reply_kind = _broadcast_media_kind(reply) if reply else None
-    args_text = " ".join(context.args) if context.args else None
+    # Read the text (and its formatting) straight off the message instead
+    # of context.args, which drops bold/italic/spoiler entities and
+    # collapses newlines. Falls back to context.args if the message text
+    # somehow doesn't start with the command.
+    msg_text = update.message.text or ""
+    cmd_m    = _BROADCAST_CMD_CAPTION_RE.match(msg_text)
+    if cmd_m:
+        args_text = _broadcast_text_from_message(msg_text, update.message.entities, cmd_m.end()).strip() or None
+    else:
+        args_text = " ".join(context.args) if context.args else None
 
     draft = BROADCAST_DRAFTS.setdefault(admin_id, {"audience": "all", "text": None})
     if reply_kind:
@@ -12787,7 +13054,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif args_text:
         draft["text"], draft["media"] = args_text, None
     elif reply and reply.text:
-        draft["text"], draft["media"] = reply.text, None
+        draft["text"], draft["media"] = _broadcast_text_from_message(reply.text, reply.entities), None
     AWAITING_BROADCAST_MESSAGE.pop(admin_id, None)
 
     body, markup = _broadcast_composer_view(admin_id)
