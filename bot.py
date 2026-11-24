@@ -1216,6 +1216,7 @@ async def save_analytics():
     await _write_json_fast(ANALYTICS_FILE, lambda: ANALYTICS, ensure_ascii=False)
 
 ANALYTICS: dict = load_analytics()
+_dedupe_strings(ANALYTICS)   # share equal strings (json.load copies each one)
 
 # Message ID of the currently pinned analytics backup in ANALYTICS_GROUP_ID.
 # Populated on startup by restore_analytics_from_channel; the pin is the
@@ -1227,7 +1228,7 @@ _analytics_backup_msg_id: int | None = None
 # like lecture-answer XP can fire dozens of times a minute and would
 # otherwise risk hitting Telegram's rate limits.
 _last_analytics_backup_at: float = 0.0
-ANALYTICS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
+ANALYTICS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "600"))  # seconds
 
 # ── Local-disk debounce for the hot answer path ──────────────────
 # save_analytics() itself (deepcopy + atomic write of the WHOLE file, every
@@ -2177,17 +2178,16 @@ def _uni_of_user(user_id) -> str:
 def _uni_of_year(year) -> str:
     return year_university(year) if isinstance(year, str) else UNIVERSITY_ORDER[0]
 
-def _build_university_zip(base: str, parts: dict) -> bytes:
-    """parts = {"mfm": obj, "mnu": obj} -> zip bytes containing
-    <base>_mfm.json and <base>_mnu.json (both always present, even if
-    one is empty, so a restore can tell "no MNU data" from "broken zip").
+def _build_university_zip(base: str, parts: dict, extra_members=()):
+    """parts = {"mfm": obj, "mnu": obj} -> a rewound file object (SpooledTemporaryFile, see
+    _build_zip_spooled) holding a zip with <base>_mfm.json and <base>_mnu.json (both always
+    present, even if one is empty, so a restore can tell "no MNU data" from "broken zip"),
+    then any extra_members [(name, obj)] after them.
     Compact JSON + fixed zip timestamps: smaller uploads, and identical data
     yields identical bytes (so an unchanged backup can be skipped)."""
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for uni in UNIVERSITY_ORDER:
-            _zip_member(zf, f"{base}_{uni}.json", json.dumps(parts[uni], separators=(",", ":"), ensure_ascii=False))
-    return buf.getvalue()
+    members = [(f"{base}_{uni}.json", parts[uni]) for uni in UNIVERSITY_ORDER]
+    members.extend(extra_members)
+    return _build_zip_spooled(members)
 
 def _read_university_backup(raw: bytes, base: str) -> list:
     """Parsed payload(s) of a pinned backup: one per university for the
@@ -2255,7 +2255,7 @@ async def backup_analytics_to_channel(context, force: bool = False):
     try:
         sent = await _send_backup_doc(context.bot, "analytics", data,
             chat_id=ANALYTICS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("analytics.zip")),
+            document=InputFile(_backup_file(data), filename=_backup_filename("analytics.zip")),
             caption=ANALYTICS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -2391,7 +2391,7 @@ _settings_backup_msg_id: int | None = None
 
 # Channel mirror debounce — separate from the local-disk debounce below.
 _last_settings_backup_at: float = 0.0
-SETTINGS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
+SETTINGS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "600"))  # seconds
 
 # ── Local-disk debounce for the hot settings paths ────────────────
 # save_settings() itself (deepcopy + atomic write of EVERY user's settings,
@@ -2716,7 +2716,7 @@ async def backup_settings_to_channel(context, force: bool = False):
     try:
         sent = await _send_backup_doc(context.bot, "settings", data,
             chat_id=SETTINGS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("settings.zip")),
+            document=InputFile(_backup_file(data), filename=_backup_filename("settings.zip")),
             caption=SETTINGS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -2796,6 +2796,7 @@ async def save_lecture_results():
     await _write_json_fast(LECTURE_RESULTS_FILE, lambda: LECTURE_RESULTS, ensure_ascii=False)
 
 LECTURE_RESULTS: dict = load_lecture_results()
+_dedupe_strings(LECTURE_RESULTS)
 
 # Message ID of the currently pinned lecture-results backup in
 # LECTURE_RESULTS_GROUP_ID. Populated on startup by
@@ -2805,7 +2806,7 @@ _lecture_results_backup_msg_id: int | None = None
 # Same debounce pattern as analytics/settings — local save always
 # happens immediately; only the channel mirror is throttled.
 _last_lecture_results_backup_at: float = 0.0
-LECTURE_RESULTS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
+LECTURE_RESULTS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "600"))  # seconds
 
 def _lr_key(year: str, lecture_key: str) -> str:
     """LECTURE_RESULTS is one shared file across all years — prefix with
@@ -2929,21 +2930,17 @@ async def backup_lecture_results_to_channel(context, force: bool = False):
         return   # backed up recently enough — local save_lecture_results() already has the latest data
     _last_lecture_results_backup_at = now
     _daily_lb_backup_pending = False   # this upload carries the current daily leaderboard (re-armed below on failure)
-    data = _build_university_zip("lecture_results", _split_lecture_results_by_university())
     # The Daily Quiz leaderboard rides in the same zip as one extra member.
     # _read_university_backup only looks at the per-university members, so
     # older code reading this zip simply ignores it.
-    _zbuf = BytesIO(data)
-    with zipfile.ZipFile(_zbuf, "a", zipfile.ZIP_DEFLATED) as _zf:
-        _zip_member(_zf, DAILY_LEADERBOARD_ZIP_MEMBER,
-                    json.dumps(_daily_leaderboard_payload(), separators=(",", ":"), ensure_ascii=False))
-    data = _zbuf.getvalue()
+    data = _build_university_zip("lecture_results", _split_lecture_results_by_university(),
+                                 extra_members=[(DAILY_LEADERBOARD_ZIP_MEMBER, _daily_leaderboard_payload())])
     if not repair and _backup_is_duplicate("lecture_results", data):
         return
     try:
         sent = await _send_backup_doc(context.bot, "lecture_results", data,
             chat_id=LECTURE_RESULTS_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("lecture_results.zip")),
+            document=InputFile(_backup_file(data), filename=_backup_filename("lecture_results.zip")),
             caption=LECTURE_RESULTS_BACKUP_MARKER,
         )
     except Exception as e:
@@ -3084,8 +3081,21 @@ async def save_mistakes_bank():
     # serializing the same live list to JSON.
     await _write_json_fast(MISTAKES_BANK_FILE, lambda: MISTAKES_BANK, ensure_ascii=False)
 
+def _intern_bank(bank: list) -> None:
+    """Makes equal ints/strings across all entries share ONE object (json.load creates a separate
+    copy per entry, incl. the short strings _dedupe_strings skips). Exact-type check only: never
+    touches bools/floats/lists/dicts, so saved JSON stays byte-identical. Values are swapped in place
+    for existing keys (dict size unchanged), so iterating items() is safe."""
+    c: dict = {}
+    for m in bank:
+        if isinstance(m, dict):
+            for k, v in m.items():
+                if type(v) is str or type(v) is int:
+                    m[k] = c.setdefault(v, v)
+
 MISTAKES_BANK: list = load_mistakes_bank()
 _dedupe_strings(MISTAKES_BANK)   # equal question/option texts share one object (was one copy per mistake)
+_intern_bank(MISTAKES_BANK)      # same for user_id / mid / year / short module+subject values
 
 # ── Per-user index over MISTAKES_BANK ───────────────────────────
 # MISTAKES_BANK is one flat list holding every user's entries (see
@@ -3130,7 +3140,7 @@ _mistakes_bank_backup_msg_id: int | None = None
 
 # Channel mirror debounce — separate from the local-disk debounce below.
 _last_mistakes_bank_backup_at: float = 0.0
-MISTAKES_BANK_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))  # seconds
+MISTAKES_BANK_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "600"))  # seconds
 
 # ── Local-disk debounce for the hot mistakes-bank path ─────────────
 # save_mistakes_bank() (deepcopy + atomic write of EVERY user's mistakes,
@@ -3207,7 +3217,7 @@ async def backup_mistakes_bank_to_channel(context, force: bool = False):
     try:
         sent = await _send_backup_doc(context.bot, "mistakes_bank", data,
             chat_id=MISTAKES_BANK_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=_backup_filename("mistakes_bank.zip")),
+            document=InputFile(_backup_file(data), filename=_backup_filename("mistakes_bank.zip")),
             caption=MISTAKES_BANK_BACKUP_MARKER,
         )
     except Exception as e:
@@ -3249,6 +3259,8 @@ async def restore_mistakes_bank_from_channel(app) -> str:
         if len(clean) != len(restored):
             print(f"MISTAKES BANK: dropped {len(restored) - len(clean)} malformed entr(y/ies) from the channel backup on restore.")
         MISTAKES_BANK[:] = clean
+        _dedupe_strings(MISTAKES_BANK)
+        _intern_bank(MISTAKES_BANK)
         _reindex_mistakes_bank()
         await save_mistakes_bank()
         _mistakes_bank_backup_msg_id = pinned.message_id
@@ -4300,6 +4312,15 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
                                              results=session.get("results"))
             await persist_daily_leaderboard(context)
 
+        # The run genuinely finished — only NOW does today's Daily Quiz count as
+        # done (start_daily_quiz no longer marks it). Keyed to the day the run
+        # belongs to, so one started before the 2pm roll doesn't lock the new day.
+        _done_day = session.get("day") or _daily_quiz_day()
+        _settings_entry = _get_settings_entry(user_id)
+        _settings_entry["daily_quiz_last_date"] = _done_day
+        _mark_settings_dirty()
+        await backup_settings_to_channel(context)
+
         # Daily Quiz completion count + its tier achievement, plus the
         # basmagy/insomniac Extras — all reuse data this block already
         # has (duration/pct) or that _finalize_daily_leaderboard's medal
@@ -4502,15 +4523,29 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
             await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
         return
 
-    entry = _get_settings_entry(user_id)
-    entry["daily_quiz_last_date"] = today
-    # Hot path (every Daily Quiz start, from every user) — defer the full
-    # SETTINGS file rewrite to the periodic flush instead of paying for one
-    # on every single tap. See _mark_settings_dirty above. The channel
-    # mirror call below is cheap regardless: it's already throttled to
-    # SETTINGS_BACKUP_MIN_INTERVAL and no-ops on most calls.
-    _mark_settings_dirty()
-    await backup_settings_to_channel(context)
+    # NOTE: daily_quiz_last_date is deliberately NOT set here any more. Starting
+    # the quiz doesn't count as doing it — it's marked in
+    # _advance_daily_quiz_session only once the run genuinely finishes, so someone
+    # who abandons / gets cut off mid-way can still take today's quiz.
+    existing = DAILY_QUIZ_SESSIONS.get(user_id)
+    if existing and existing.get("day") == today:
+        # A run for today is still in progress (e.g. a stale Start button) — don't
+        # overwrite it with a fresh one now that starting no longer locks the day.
+        text = "⚠️ عندك Daily Quiz شغال بالفعل — كمّل الأسئلة اللي فوق، أو لغيه وابدأ من الأول."
+        # Always offer a way out (the existing qabandon flow pops the session WITHOUT marking
+        # today as done), so a stuck run — deleted poll message, lost resume prompt — can
+        # never lock the person out of today's quiz now that starting no longer marks it.
+        _rows = []
+        if existing.get("paused"):
+            _rows.append([InlineKeyboardButton("▶️ Resume Daily Quiz", callback_data="qresume:daily")])
+        _rows.append([InlineKeyboardButton("🥀 Abandon Daily Quiz", callback_data="qabandon:daily")])
+        _rows.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+        keyboard = InlineKeyboardMarkup(_rows)
+        if message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        return
 
     session = {
         "queue": list(questions), "current_poll_id": None, "current_correct_id": None,
@@ -5074,7 +5109,7 @@ async def save_storage_backup_state():
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
-STORAGE_BACKUP_MIN_INTERVAL = int(os.environ.get("STORAGE_BACKUP_MIN_INTERVAL", "300"))
+STORAGE_BACKUP_MIN_INTERVAL = int(os.environ.get("STORAGE_BACKUP_MIN_INTERVAL", "600"))
 _last_storage_backup_at: float = -1e9
 
 async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
@@ -5094,15 +5129,14 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE, force: b
         return False
     _last_storage_backup_at = now
     payload = {"users": list(USERS), "storage_index": STORAGE_INDEX}
-    data    = json.dumps(payload).encode("utf-8")
     # The analytics history (stats_history.json) travels in the same pinned
-    # document — a zip of the two files — so it needs no group of its own.
-    _zbuf = BytesIO()
-    with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-        _zip_member(zf, STORAGE_BACKUP_JSON_NAME, data.decode("utf-8"))
-        _zip_member(zf, STATS_HISTORY_FILE, json.dumps(STATS_HISTORY, separators=(",", ":"), ensure_ascii=False))
-        _zip_member(zf, BROADCAST_LOG_FILE, json.dumps(BROADCAST_LOG, separators=(",", ":"), ensure_ascii=False))
-    data = _zbuf.getvalue()
+    # document — a zip of the files — so it needs no group of its own.
+    # (The storage member keeps json.dumps's default separators, as before.)
+    data = _build_zip_spooled([
+        (STORAGE_BACKUP_JSON_NAME, payload, False),
+        (STATS_HISTORY_FILE, STATS_HISTORY),
+        (BROADCAST_LOG_FILE, BROADCAST_LOG),
+    ])
     if not repair and _backup_is_duplicate("storage", data):
         return True   # identical to what's already pinned
     # A pinned document instead of a pinned text message: Bot API caps
@@ -5113,7 +5147,7 @@ async def backup_storage_to_channel(context: ContextTypes.DEFAULT_TYPE, force: b
     try:
         sent = await _send_backup_doc(context.bot, "storage", data,
             chat_id=STORAGE_GROUP_ID,
-            document=InputFile(BytesIO(data), filename=filename),
+            document=InputFile(_backup_file(data), filename=filename),
             caption=STORAGE_BACKUP_MARKER,
         )
     except Exception as e:
@@ -5254,6 +5288,7 @@ async def save_quiz_index(year: str):
 
 # year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
 QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
+_dedupe_strings(QUIZ_INDEX)
 
 # Matches "<Subject> Lecture <number>", e.g. "Physiology Lecture 3"
 _LECTURE_TITLE_RE = re.compile(r"^(.*?)\s+Lecture\s+(\d+)\s*$", re.IGNORECASE)
@@ -5345,6 +5380,7 @@ async def save_quiz_poll_status(year: str):
 # only allows copying a quiz poll once its correct answer is known, i.e.
 # once it's been stopped, so this is what /quiz delivery checks against.
 QUIZ_POLL_STATUS: dict = {y: load_quiz_poll_status(y) for y in YEARS}
+_dedupe_strings(QUIZ_POLL_STATUS)
 
 # ── Durable backup: same pinned-message trick as the storage group, so
 # each year's lecture/quiz index survives a host switch or wiped local
@@ -5941,7 +5977,7 @@ REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id",
 
 _report_threads_backup_msg_id: int | None = None
 _last_report_threads_backup_at: float = 0.0
-REPORT_THREADS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))   # seconds — same debounce as mistakes bank; local save is never throttled
+REPORT_THREADS_BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "600"))   # seconds — same debounce as mistakes bank; local save is never throttled
 
 async def backup_report_threads_to_channel(context, force: bool = False):
     global _report_threads_backup_msg_id, _last_report_threads_backup_at
@@ -6012,7 +6048,8 @@ async def restore_report_threads_from_channel(app) -> str:
 
 # ═══════════════════════════════════════════════════════════════
 # SESSION PERSISTENCE — LECTURE_SESSIONS / DAILY_QUIZ_SESSIONS /
-# MISTAKES_RETAKE_SESSIONS were previously purely in-memory (see the file
+# MISTAKES_RETAKE_SESSIONS (and EVENT_SESSIONS: in-flight /event + Custom Quiz
+# runs, see _restore_event_sessions) were previously purely in-memory (see the file
 # index note at the top of this file) — a restart mid-quiz dropped every
 # active session, which is exactly the "الجلسة دي اتقفلت" path in
 # handle_poll_answer. This mirrors REPORT_THREADS' persistence pattern
@@ -6036,16 +6073,16 @@ async def restore_report_threads_from_channel(app) -> str:
 #     ONE deletes the previous pinned message on each new upload. A 30s
 #     cadence keeping full history would post thousands of documents a
 #     day for data nobody needs a history of.
-#   - A session older than SESSIONS_MAX_AGE_SECONDS (3 days) is dropped on
+#   - A session older than SESSIONS_MAX_AGE_SECONDS (24 hours) is dropped on
 #     restore rather than revived — see _cleanup_stale_sessions_job's own
-#     3-day idle-based cleanup, which already reclaims abandoned sessions
-#     during normal operation; this 3-day check is just what keeps a
+#     24-hour idle-based cleanup, which already reclaims abandoned sessions
+#     during normal operation; this 24-hour check is just what keeps a
 #     restored snapshot from ever reviving something that old.
-#   - _sessions_stale_sweep_job additionally re-runs that same 3-day check
+#   - _sessions_stale_sweep_job additionally re-runs that same 24-hour check
 #     against the LIVE in-memory dicts every day, as an independent
 #     backstop in case _cleanup_stale_sessions_job's hourly job was ever
 #     down for an extended stretch (e.g. a JobQueue outage) — it only
-#     removes entries already past 3 days old, never active sessions, so it
+#     removes entries already past 24 hours old, never active sessions, so it
 #     can't interrupt anyone mid-quiz.
 # ═══════════════════════════════════════════════════════════════
 SESSIONS_FILE                = "sessions.json"
@@ -6056,7 +6093,7 @@ _RESTORED_SESSIONS: set = set()
 SESSIONS_BACKUP_MARKER       = "🧩 QUIZICIAN_SESSIONS_BACKUP"
 SESSIONS_BACKUP_MIN_INTERVAL = int(os.environ.get("SESSIONS_BACKUP_INTERVAL", "300"))          # seconds
 SESSIONS_BACKUP_WARN_BYTES   = 1_500_000   # log a warning when one upload is bigger than this (compressed)
-SESSIONS_MAX_AGE_SECONDS     = 3 * 24 * 3600   # 3 days — must not be shorter than STALE_SESSION_IDLE_SECONDS, or a
+SESSIONS_MAX_AGE_SECONDS     = 24 * 3600   # 24 hours — must not be shorter than STALE_SESSION_IDLE_SECONDS, or a
                                                    # restore / the stale sweep would kill sessions the idle rule still allows
 
 # ── Sessions snapshot size ───────────────────────────────────────
@@ -6076,7 +6113,7 @@ SESSIONS_MAX_AGE_SECONDS     = 3 * 24 * 3600   # 3 days — must not be shorter 
 _QPOOL_KEY  = "_qpool"
 _QREF_KEY   = "__q"
 _QPOOL_SECTIONS = ("lecture_sessions", "paused_lecture_sessions", "daily_quiz_sessions", "mistakes_retake_sessions",
-                   "bookmarks_retake_sessions", "daily_quiz_questions", "next_daily_quiz_questions")
+                   "bookmarks_retake_sessions", "event_sessions", "daily_quiz_questions", "next_daily_quiz_questions")
 
 def _qpool_encode(snapshot: dict) -> dict:
     pool: dict = {}
@@ -6176,6 +6213,8 @@ def _sessions_snapshot() -> dict:
         "daily_quiz_sessions":       _clean(DAILY_QUIZ_SESSIONS),
         "mistakes_retake_sessions":  _clean(MISTAKES_RETAKE_SESSIONS),
         "bookmarks_retake_sessions": _clean(BOOKMARKS_RETAKE_SESSIONS),
+        # In-flight /event and 🎯 Custom Quiz runs (a custom run carries its own private question copies in s["ev"]).
+        "event_sessions":            _clean(EVENT_SESSIONS),
         # Shared per-day Daily Quiz question sets — see the "Per-day,
         # per-year shared Daily Quiz questions" section above for why
         # these ride along in the same snapshot/backup as the sessions.
@@ -6198,7 +6237,7 @@ def _sessions_snapshot() -> dict:
     })
 
 def _session_age_seconds(session: dict) -> float:
-    """Best-effort age for the 3-day checks above. Lecture sessions have
+    """Best-effort age for the 24-hour checks above. Lecture sessions have
     started_at; Daily Quiz / mistakes-retake sessions don't, so this
     falls back to current_delivered_at (when the in-flight question was
     sent). If neither is present, treat it as already-ancient rather
@@ -6209,7 +6248,7 @@ def _session_age_seconds(session: dict) -> float:
     return time.time() - anchor
 
 def _session_expired(session: dict) -> bool:
-    """The 3-day limit, except for a lecture the person paused on purpose: that one is kept until
+    """The 24-hour limit, except for a lecture the person paused on purpose: that one is kept until
     they resume or discard it (no timer)."""
     if session.get("manual_pause"):
         return False
@@ -6307,6 +6346,8 @@ def _restore_sessions_dict(raw: dict) -> None:
     EVENTS.clear()
     EVENTS.update(raw.get("events") or {})
     _events_rekey()   # snapshots from before multi-event keyed EVENTS by year
+    if "event_sessions" in raw:   # snapshots from before event runs were saved: leave any live runs alone
+        _restore_event_sessions(raw.get("event_sessions"))
     if isinstance(raw.get("honor_lists"), dict):   # older snapshots predate it — leave the live lists alone
         HONOR_LISTS.clear()
         HONOR_LISTS.update({k: v for k, v in raw["honor_lists"].items() if isinstance(v, str)})
@@ -6319,6 +6360,41 @@ def _restore_sessions_dict(raw: dict) -> None:
                                                        "lectures": _old.get("lectures", 0)}}})
     print(f"Restored {restored} session(s) ({dropped_stale} dropped as stale), "
           f"daily quiz questions for {len(_DAILY_QUIZ_QUESTIONS)} year(s) dated {_DAILY_QUIZ_QUESTIONS_DATE}.")
+
+_EVENT_SESSION_REQUIRED = ("queue", "total", "answered", "correct", "delivered")
+
+def _restore_event_sessions(raw_sessions) -> None:
+    """Puts back the in-flight /event and 🎯 Custom Quiz runs from a snapshot, so a restart mid-event no
+    longer drops everyone's run. Skips (never raises on) anything malformed, older than the 24-hour limit,
+    or belonging to an event that no longer exists / isn't live. A restored run is marked in
+    _RESTORED_SESSIONS so a snapshot that is a question or two behind gets re-synced (see
+    _resync_restored_session). The timestamp of the question that was in flight is dropped: it would
+    otherwise count the downtime as the student's thinking time on the event leaderboard."""
+    EVENT_SESSIONS.clear()
+    restored = dropped = 0
+    for uid_str, es in (raw_sessions or {}).items():
+        try:
+            if (not isinstance(es, dict) or not isinstance(es.get("queue"), list)
+                    or any(k not in es for k in _EVENT_SESSION_REQUIRED) or _session_expired(es)):
+                dropped += 1
+                continue
+            if es.get("custom"):
+                ok = isinstance(es.get("ev"), dict) and isinstance(es["ev"].get("questions"), list)
+            else:
+                ev = EVENTS.get(es.get("eid"))
+                ok = bool(ev and ev.get("live") and not ev.get("ended"))
+            if not ok:
+                dropped += 1
+                continue
+            es.pop("q_sent_at", None)
+            uid = int(uid_str)
+            EVENT_SESSIONS[uid] = es
+            _RESTORED_SESSIONS.add(("event", uid))
+            restored += 1
+        except Exception as e:
+            dropped += 1
+            print(f"EVENT SESSIONS — skipped one entry on restore ({type(e).__name__}: {e})")
+    print(f"Restored {restored} event session(s) ({dropped} dropped).")
 
 def load_sessions() -> dict | None:
     # None (not {}) for a missing file is load-bearing: callers use it to tell
@@ -6419,21 +6495,21 @@ async def _sessions_backup_job(context: ContextTypes.DEFAULT_TYPE):
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context)
 
-SESSIONS_STALE_SWEEP_INTERVAL = 24 * 3600  # seconds — daily, so a swept session is at most ~1 day past the 3-day limit
+SESSIONS_STALE_SWEEP_INTERVAL = 24 * 3600  # seconds — daily, so a swept session is at most ~1 day past the 24-hour limit
 
 async def _sessions_stale_sweep_job(context: ContextTypes.DEFAULT_TYPE):
     """Independent backstop alongside _cleanup_stale_sessions_job's normal
-    3-day idle-based cleanup — see the section banner above. Only removes
+    24-hour idle-based cleanup — see the section banner above. Only removes
     entries already older than SESSIONS_MAX_AGE_SECONDS; never touches an
     active session, so this can't interrupt anyone mid-quiz."""
     removed = 0
-    for sessions in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS):
+    for sessions in (LECTURE_SESSIONS, DAILY_QUIZ_SESSIONS, MISTAKES_RETAKE_SESSIONS, EVENT_SESSIONS):
         for user_id, session in list(sessions.items()):
             if _session_expired(session):
                 sessions.pop(user_id, None)
                 removed += 1
     if removed:
-        print(f"SESSIONS — 3-day stale sweep removed {removed} session(s).")
+        print(f"SESSIONS — 24-hour stale sweep removed {removed} session(s).")
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context)
 
@@ -6485,12 +6561,35 @@ _QUIZ_KIND_LABEL = {"daily": "Daily Quiz", "retake": "Retake", "bmretake": "Book
 RESYNC_NOTICE_TEXT = "البوت أتعمله Restart ولازم ترجع تحل من هنا، وعذراً على الإزعاج 🙃❤️"
 
 def _mark_session_in_sync(user_id: int) -> None:
-    for _k in ("lecture", "daily", "retake", "bmretake"):
+    for _k in ("lecture", "daily", "retake", "bmretake", "event"):
         _RESTORED_SESSIONS.discard((_k, user_id))
 
 async def _resync_restored_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Returns True if a question was re-sent. Never raises."""
     try:
+        if ("event", user_id) in _RESTORED_SESSIONS:   # a restored /event or Custom Quiz run that is behind
+            es = EVENT_SESSIONS.get(user_id)
+            if (es and es.get("current_poll_id") and es.get("current_q") is not None
+                    and es.get("written_pending_msg") is None):
+                es["queue"].insert(0, es["current_q"])
+                es["delivered"] = max(0, es.get("delivered", 0) - 1)   # it reuses its number
+                es["last_case_group"] = None                           # a re-sent question shows its case study again
+                for key in ("current_poll_id", "current_correct_id", "current_option_count", "current_q"):
+                    es[key] = None
+                es.pop("q_sent_at", None)
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=RESYNC_NOTICE_TEXT)
+                except Exception:
+                    pass
+                sent = await _event_send_next(context, user_id, es)   # marks the run in sync once a question is out
+                if not sent:
+                    ev = _event_of(es)
+                    if ev and ev.get("live"):
+                        await _event_finish(context, user_id, es, ev)
+                    else:
+                        EVENT_SESSIONS.pop(user_id, None)
+                await _flush_sessions_if_changed()
+                return bool(sent)
         for kind, store in _SESSION_STORE_BY_KIND.items():
             if (kind, user_id) not in _RESTORED_SESSIONS:
                 continue
@@ -10775,7 +10874,7 @@ async def add_lecture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # It is NOT stored in QUIZ_INDEX (so it never shows
 # up in the module/lecture lists): it rides in the SESSIONS snapshot
 # (_sessions_snapshot / _restore_sessions_dict -> sessions.json + the pinned
-# backup in SESSIONS_GROUP_ID) and is exempt from the 3-day session expiry. It
+# backup in SESSIONS_GROUP_ID) and is exempt from the 24-hour session expiry. It
 # lives there until /event_end deletes it.
 #   draft  (live=False): admin is still forwarding polls; invisible to users
 #   live   (live=True) : a green button on top of the main menu for that
@@ -10825,7 +10924,7 @@ AWAITING_EVENT_NAME: dict = {}   # admin uid -> True while waiting for the typed
 AWAITING_EVENT_DESC: dict = {}   # admin uid -> True while waiting for the event description
 EVENT_PICK: dict = {}            # admin uid -> {"name","description"} while choosing uni / year
 EVENT_AUTHORING: dict = {}       # admin uid -> {"eid","year","pending_image","pending_case_study","status_message_id"}
-EVENT_SESSIONS: dict = {}        # user uid -> in-flight event run (RAM only)
+EVENT_SESSIONS: dict = {}        # user uid -> in-flight event / Custom Quiz run (saved in the sessions snapshot: restart-safe)
 EVENT_NAME_MAX_LEN = 40
 EVENT_DESC_MAX_LEN = 1500   # raw characters; the preview screen must stay under Telegram's 4096 limit
 EVENT_STATUS_DELAY = 1.5
@@ -11380,6 +11479,7 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
             s["current_poll_id"] = None
             s["current_correct_id"] = None
             s["current_option_count"] = None
+            s["current_q"] = None
             return True
         q = next((x for x in questions if x.get("id") == idx), None)   # queue holds stable ids
         if q is None:
@@ -11422,8 +11522,11 @@ async def _event_send_next(context, user_id: int, s: dict) -> bool:
         s["current_poll_id"]      = msg.poll.id
         s["current_correct_id"]   = ev_correct
         s["current_option_count"] = len(q["options"])
+        s["current_q"]            = idx   # the question in flight: a restored run re-sends it if the backup is behind
+        _mark_session_in_sync(user_id)
         return True
     s["current_poll_id"] = None
+    s["current_q"] = None
     return False
 
 async def _event_advance(context, user_id: int, s: dict, is_correct: bool) -> None:
@@ -11708,7 +11811,7 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     n_polls = len(ev["questions"])
     s = {
         "eid": eid, "year": ev["year"], "queue": queue, "total": n_polls, "answered": 0, "correct": 0,
-        "delivered": 0, "duration": 0.0,
+        "delivered": 0, "duration": 0.0, "started_at": time.time(),
         "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
     }
     EVENT_SESSIONS[uid] = s
@@ -12123,7 +12226,7 @@ async def _custom_quiz_run(context, uid: int, st: dict, qs: list, n_lectures: in
     s = {
         "eid": None, "ev": ev, "custom": True, "year": st["year"], "prev_pct": st.get("prev_pct", 0),
         "queue": [q["id"] for q in qs],
-        "total": len(qs), "answered": 0, "correct": 0, "delivered": 0, "duration": 0.0,
+        "total": len(qs), "answered": 0, "correct": 0, "delivered": 0, "duration": 0.0, "started_at": time.time(),
         "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
     }
     EVENT_SESSIONS[uid] = s
@@ -20657,16 +20760,16 @@ async def all_nicknames_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # RAILWAY EFFICIENCY — fewer/lighter channel backups (network egress) and a
 # leaner process (memory). Everything is tunable from Railway variables:
-#   BACKUP_MIN_INTERVAL        seconds between uploads of each data backup (default 300)
+#   BACKUP_MIN_INTERVAL        seconds between uploads of each data backup (default 600)
 #   SESSIONS_BACKUP_INTERVAL   same for the live-sessions backup (default 300 — a restored session re-sends its expected question, so a slightly stale backup self-heals)
-#   STORAGE_BACKUP_MIN_INTERVAL users/storage/stats zip (default 300)
+#   STORAGE_BACKUP_MIN_INTERVAL users/storage/stats zip (default 600)
 #   BACKUP_RECONCILE_INTERVAL  how often pins are checked (default 300)
 #   BOOKMARKABLE_LIMIT         past questions remembered per student for 🔖 reactions (default 150)
 # A backup that is skipped because it is "too soon" is remembered and retried by
 # _backup_trailing_job, so the LAST change is never left un-backed-up; identical
 # content is never uploaded twice; and a clean shutdown force-uploads everything.
 # ═══════════════════════════════════════════════════════════════
-BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "300"))
+BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "600"))
 
 try:   # glibc only: fewer malloc arenas = much less RSS growth when worker threads (to_thread) allocate
     import ctypes, ctypes.util
@@ -20698,18 +20801,102 @@ def _backup_take_force(key: str) -> bool:
         return True
     return False
 
-def _backup_is_duplicate(key: str, data: bytes) -> bool:
-    return _BACKUP_LAST_HASH.get(key) == hashlib.sha1(data).hexdigest()
+# ── Streamed backup zips ─────────────────────────────────────────
+# A backup used to be built as: json.dumps (the whole JSON as ONE string) -> encode ->
+# BytesIO zip -> getvalue() copy -> BytesIO(data) copy for the upload, so the peak held the
+# raw JSON plus several copies of the zip at once. Now each member is streamed straight into
+# the zip in ~64 KB pieces (json.iterencode) and the zip lives in a SpooledTemporaryFile:
+# small backups stay in RAM, anything over _BACKUP_SPOOL_MAX_BYTES spills to a temp file on
+# disk. The result is a file object ("data") that _backup_is_duplicate / _send_backup_doc /
+# _backup_file accept wherever they used to take bytes. Still built on the event loop on
+# purpose (NOT to_thread): the dicts being dumped are mutated live by handlers, and iterating
+# them from another thread could raise "changed size during iteration".
+_BACKUP_SPOOL_MAX_BYTES = 4 * 1024 * 1024
+_BACKUP_STREAM_CHUNK    = 64 * 1024
+_BACKUP_COMPACT_ENCODER = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False)
+_BACKUP_DEFAULT_ENCODER = json.JSONEncoder()   # what a bare json.dumps(obj) uses
 
-async def _send_backup_doc(bot, key: str, data: bytes, **kwargs):
-    """send_document for a backup, plus: remember what was sent (duplicate check) and count the bytes (/health)."""
-    sent = await bot.send_document(**kwargs)
-    _BACKUP_LAST_HASH[key] = hashlib.sha1(data).hexdigest()
+def _zip_json_member(zf, name: str, obj, compact: bool = True) -> None:
+    """_zip_member(zf, name, json.dumps(obj, ...)) without ever holding the whole JSON string.
+    Same fixed timestamp, so identical data still gives byte-identical zips (duplicate detection)."""
+    enc = _BACKUP_COMPACT_ENCODER if compact else _BACKUP_DEFAULT_ENCODER
+    zi = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    with zf.open(zi, "w") as out:
+        parts, size = [], 0
+        for piece in enc.iterencode(obj):
+            parts.append(piece)
+            size += len(piece)
+            if size >= _BACKUP_STREAM_CHUNK:
+                out.write("".join(parts).encode("utf-8"))
+                parts, size = [], 0
+        if parts:
+            out.write("".join(parts).encode("utf-8"))
+
+def _build_zip_spooled(members) -> "tempfile.SpooledTemporaryFile":
+    """members = [(name, obj) or (name, obj, compact)] -> zip in a SpooledTemporaryFile, rewound to 0."""
+    tmp = tempfile.SpooledTemporaryFile(max_size=_BACKUP_SPOOL_MAX_BYTES)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for m in members:
+                _zip_json_member(zf, m[0], m[1], m[2] if len(m) > 2 else True)
+        tmp.seek(0)
+        return tmp
+    except BaseException:
+        tmp.close()
+        raise
+
+def _backup_fingerprint(data):
+    """(sha1 hex, size) of backup bytes OR of a file object (hashed in chunks, left rewound)."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return hashlib.sha1(data).hexdigest(), len(data)
+    h, n = hashlib.sha1(), 0
+    data.seek(0)
+    while True:
+        chunk = data.read(1024 * 1024)
+        if not chunk:
+            break
+        h.update(chunk)
+        n += len(chunk)
+    data.seek(0)
+    return h.hexdigest(), n
+
+def _backup_file(data):
+    """A readable, rewound file object for InputFile — BytesIO for bytes, the file itself otherwise."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return BytesIO(data)
+    data.seek(0)
+    return data
+
+def _backup_close(data) -> None:
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        try:
+            data.close()
+        except Exception:
+            pass
+
+def _backup_is_duplicate(key: str, data) -> bool:
+    """True if this backup is identical to the last one uploaded. A file-object `data` is closed
+    when it IS a duplicate (nothing else will use it); otherwise _send_backup_doc closes it."""
+    dup = _BACKUP_LAST_HASH.get(key) == _backup_fingerprint(data)[0]
+    if dup:
+        _backup_close(data)
+    return dup
+
+async def _send_backup_doc(bot, key: str, data, **kwargs):
+    """send_document for a backup, plus: remember what was sent (duplicate check) and count the bytes (/health).
+    `data` is the backup as bytes or as a file object; a file object is closed here, success or failure."""
+    try:
+        sent = await bot.send_document(**kwargs)
+        digest, size = _backup_fingerprint(data)
+    finally:
+        _backup_close(data)
+    _BACKUP_LAST_HASH[key] = digest
     today = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
     if _EGRESS_TODAY["day"] != today:
         _EGRESS_TODAY["day"], _EGRESS_TODAY["by"] = today, {}
-    _EGRESS_TODAY["by"][key] = _EGRESS_TODAY["by"].get(key, 0) + len(data)
-    _stat_add("egress_bytes", len(data))
+    _EGRESS_TODAY["by"][key] = _EGRESS_TODAY["by"].get(key, 0) + size
+    _stat_add("egress_bytes", size)
     return sent
 
 def _zip_member(zf, name: str, text: str) -> None:
@@ -20731,7 +20918,7 @@ async def _dedupe_sessions_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Once, shortly after boot: sessions restored from the JSON backup each carry their own copy of the
     same question texts (in memory they were shared before the restart) — merge the equal strings."""
     cache: dict = {}
-    for store in (LECTURE_SESSIONS, PAUSED_LECTURE_SESSIONS, MISTAKES_RETAKE_SESSIONS, DAILY_QUIZ_SESSIONS):
+    for store in (LECTURE_SESSIONS, PAUSED_LECTURE_SESSIONS, MISTAKES_RETAKE_SESSIONS, DAILY_QUIZ_SESSIONS, EVENT_SESSIONS):
         _dedupe_strings(store, cache)
     _trim_memory()
 
@@ -20753,6 +20940,10 @@ async def _prune_question_meta_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         print(f"MEMORY — pruned remembered questions of {dropped} inactive student(s).")
 
 async def _memory_trim_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        _record_memory_sample()   # sampled BEFORE the trim: that is the memory the bot actually held
+    except Exception:
+        pass
     now = time.time()
     for u, h in list(_QZ_HISTORY.items()):
         if now - h["t"] > QZ_HISTORY_TTL:
@@ -20763,8 +20954,12 @@ async def _memory_trim_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             _QZ_USAGE.pop(u, None)
     _trim_memory()   # (no forced gc.collect(): a full pass can pause the bot for ~100-300 ms; Python's own GC runs on its own)
 
-def _deep_sizeof(root, limit: int = 4_000_000):
-    seen, stack, total, n = set(), [root], 0, 0
+def _deep_sizeof(root, limit: int = 4_000_000, seen: set | None = None):
+    """Total size of `root` and everything reachable from it. Pass the SAME `seen` set to several calls
+    and every object is counted only once across all of them (that is how the unique total is built);
+    without it each call is independent (inclusive: shared objects count in every structure holding them)."""
+    seen = set() if seen is None else seen
+    stack, total, n = [root], 0, 0
     while stack and n < limit:
         o = stack.pop()
         if id(o) in seen:
@@ -20775,11 +20970,14 @@ def _deep_sizeof(root, limit: int = 4_000_000):
             total += sys.getsizeof(o)
         except Exception:
             continue
-        if isinstance(o, dict):
-            stack.extend(o.keys())
-            stack.extend(o.values())
-        elif isinstance(o, (list, tuple, set, frozenset)):
-            stack.extend(o)
+        try:
+            if isinstance(o, dict):
+                stack.extend(o.keys())
+                stack.extend(o.values())
+            elif isinstance(o, (list, tuple, set, frozenset)):
+                stack.extend(o)
+        except RuntimeError:
+            pass   # the event loop resized this container mid-scan (we run in a worker thread): skip the rest of it
     return total, n >= limit
 
 def _status_mb(field: str) -> float:
@@ -20817,16 +21015,100 @@ def _pymalloc_stats() -> dict:
         pass
     return out
 
+def _status_int(field: str) -> int:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+def _peak_rss_mb() -> float:
+    """Highest RSS since the process started (kernel's VmHWM; getrusage as fallback)."""
+    mb = _status_mb("VmHWM")
+    if mb:
+        return mb
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0   # KB on Linux
+    except Exception:
+        return 0.0
+
+def _thread_summary() -> str:
+    import threading
+    names: dict = {}
+    for t in threading.enumerate():
+        base = re.sub(r"[\d_\-]+$", "", t.name) or t.name
+        names[base] = names.get(base, 0) + 1
+    top = ", ".join(f"{html.escape(k)} {v}" for k, v in sorted(names.items(), key=lambda kv: -kv[1])[:4])
+    os_n = _status_int("Threads")
+    return (f"🧵 Threads alive: <b>{threading.active_count()}</b> Python"
+            + (f" · {os_n} OS-level (includes C-library threads)" if os_n else "")
+            + (f"\n   {top}" if top else ""))
+
+_MEM_SAMPLES_PER_DAY_HINT = "RSS sampled every 5 min, Cairo days"
+
+def _record_memory_sample() -> None:
+    """One RSS sample into today's stats-history record (mem_sum / mem_n / mem_peak), so /memory can show
+    daily averages. Rides inside STATS_HISTORY (saved + backed up with it). Deliberately does NOT mark the
+    history dirty: that would force a stats write and a Storage-backup upload every few minutes even when idle;
+    the samples are written along with the next real save instead."""
+    rss = _rss_mb()
+    if rss <= 0:
+        return
+    rec = _stats_today()[1]
+    rec["mem_sum"] = round(float(rec.get("mem_sum", 0.0)) + rss, 1)
+    rec["mem_n"] = int(rec.get("mem_n", 0)) + 1
+    rec["mem_peak"] = round(max(float(rec.get("mem_peak", 0.0)), rss), 1)
+
+def _memory_daily_lines() -> list:
+    try:
+        items = [(d, r) for d, r in list(STATS_HISTORY["days"].items()) if isinstance(r, dict) and r.get("mem_n")]
+        items.sort(reverse=True)
+        if not items:
+            return ["📊 Average daily memory: collecting… (first sample ~3 min after boot, then every 5 min)"]
+        def avg(sel):
+            n = sum(int(r["mem_n"]) for _, r in sel)
+            return (sum(float(r["mem_sum"]) for _, r in sel) / n) if n else 0.0
+        today_key = datetime.now(DAILY_QUIZ_TZ).strftime("%Y-%m-%d")
+        lines = [f"📊 <b>Average daily memory</b> ({_MEM_SAMPLES_PER_DAY_HINT})"]
+        if items[0][0] == today_key:
+            r = items[0][1]
+            lines.append(f"• Today: avg <b>{avg(items[:1]):.0f} MB</b> · peak {float(r.get('mem_peak', 0)):.0f} MB · {int(r['mem_n'])} samples")
+        lines.append(f"• Last {min(len(items), 7)} day(s) avg: <b>{avg(items[:7]):.0f} MB</b> · all {len(items)} recorded day(s): <b>{avg(items):.0f} MB</b>")
+        for d, r in items[(1 if items[0][0] == today_key else 0):][:6]:
+            lines.append(f"• {d[5:]}: avg {avg([(d, r)]):.0f} · peak {float(r.get('mem_peak', 0)):.0f} MB")
+        return lines
+    except Exception:
+        return ["📊 Average daily memory: unavailable"]
+
 def _memory_report() -> str:
     rows = []
     for name, val in list(globals().items()):
         if isinstance(val, (dict, list, set)) and len(val) > 0 and not name.startswith("__"):
-            size, capped = _deep_sizeof(val)
+            size, capped = _deep_sizeof(val)                 # inclusive: own `seen` per structure
             rows.append((size, name, len(val), capped))
     rows.sort(reverse=True)
-    total = sum(r[0] for r in rows)
+    inclusive_total = sum(r[0] for r in rows)
+    # Unique: ONE shared `seen` across every tracked structure, so an object held by several is counted once.
+    uniq_seen: set = set()
+    unique_total, unique_capped = 0, False
+    for val in [globals().get(r[1]) for r in rows]:
+        if val is None:
+            continue
+        sz, cp = _deep_sizeof(val, limit=8_000_000, seen=uniq_seen)
+        unique_total += sz
+        unique_capped = unique_capped or cp
+    uniq_seen.clear()
     rss, anon, fil = _rss_mb(), _status_mb("RssAnon"), _status_mb("RssFile")
     lines = [f"🧠 <b>Memory</b>\n\nRSS now: <b>{rss:.0f} MB</b> (heap/anonymous {anon:.0f} · shared libraries/files {fil:.0f})"]
+    lines.append(f"📈 Peak RSS since startup: <b>{_peak_rss_mb():.0f} MB</b>")
+    lines.append(_thread_summary())
+    lines.append("")
+    lines.extend(_memory_daily_lines())
+    lines.append("")
     pm = _pymalloc_stats()
     if pm:
         lines.append(f"🐍 Python objects: arenas hold <b>{pm['arenas_mb']:.0f} MB</b>, really in use <b>{pm['used_mb']:.0f} MB</b>"
@@ -20838,10 +21120,12 @@ def _memory_report() -> str:
             steps.append(f"• {html.escape(label)}: {mb:.0f} MB" + (f" (+{mb - prev:.0f})" if prev else ""))
             prev = mb
         lines.append("\n<b>Boot:</b>\n" + "\n".join(steps))
-    lines.append(f"\n<b>Largest data structures</b> (~{total / 1e6:.0f} MB; shared objects count in every structure that "
-                 "holds them, so e.g. _MISTAKES_BY_USER overlaps MISTAKES_BANK):")
+    lines.append(f"\n<b>Memory per structure — inclusive</b> (shared objects count in every structure that holds "
+                 f"them, so e.g. _MISTAKES_BY_USER overlaps MISTAKES_BANK):")
     for size, name, n, capped in rows[:12]:
         lines.append(f"• <code>{html.escape(name)}</code> — {size / 1e6:.1f} MB{'+' if capped else ''} ({n:,} items)")
+    lines.append(f"\n🔗 <b>Unique across all {len(rows)} tracked structures: {unique_total / 1e6:.1f} MB{'+' if unique_capped else ''}</b>"
+                 f" (inclusive sum {inclusive_total / 1e6:.0f} MB → {max(inclusive_total - unique_total, 0) / 1e6:.0f} MB was shared/double-counted)")
     try:
         counts: dict = {}
         for o in gc.get_objects():
@@ -23070,7 +23354,7 @@ async def _flush_mistakes_bank_job(context: ContextTypes.DEFAULT_TYPE):
 # come back and finish; it's only meant to catch sessions that are,
 # realistically, abandoned for good.
 # ═══════════════════════════════════════════════════════════════
-STALE_SESSION_IDLE_SECONDS   = 3 * 24 * 3600  # 3 days of no activity before a session is reclaimed
+STALE_SESSION_IDLE_SECONDS   = 24 * 3600  # 24 hours of no activity before a session is reclaimed
 STALE_SESSION_CHECK_INTERVAL = 3600      # check once an hour
 
 async def _cleanup_stale_sessions_job(context: ContextTypes.DEFAULT_TYPE):
