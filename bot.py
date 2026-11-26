@@ -1024,7 +1024,7 @@ ACHIEVEMENTS = {
         # xp_levels' own threshold is checked against xp directly for its
         # first tier (First XP), then level for the rest — see the special
         # case in _check_achievements.
-        (2000, "First XP",     0,   "⭐", "عبي يابا"),
+        (1000, "First XP",     0,   "⭐", "عبي يابا"),
         (5,    "Level Up!",    50,  "⭐", "ما الدنيا حلوه أهي"),
         (10,   "Rising Star",  100, "⭐", "دانا نسيبلك الطلعه دي بقا"),
         (25,   "Powerhouse",   250, "⭐", "ربنا يعلي مراتبك يبني"),
@@ -1034,19 +1034,19 @@ ACHIEVEMENTS = {
     "daily_quiz": [
         (1,   "Daily Visitor", 25,  "📅", "أول يوم مدرسة أول يوم مدرسة!!"),
         (7,   "Dedicated",     75,  "📅", "أسبوع بحاله، دانت رايق بقا"),
-        (30,  "Committed",     200, "📅", "الشهر خلص، وأنت لا 💪"),
-        (100, "Disciplined",   500, "📅", "الترم قرب يخلص، بس أن شاء الله تلحق تلم الدنيا"),
+        (14,  "Committed",     200, "📅", "الشهر خلص، وأنت لا 💪"),
+        (30,  "Disciplined",   500, "📅", "الترم قرب يخلص، بس أن شاء الله تلحق تلم الدنيا"),
         # {nick} -> the unlocking user's nickname, resolved at display
         # time (see _personalize_ach_text) — this is the only tiered
         # achievement whose *name* (not just quip) is personalized.
-        (200, "{nick} was here", 1500, "📅", "i was there when it was written!"),
+        (50,  "{nick} was here", 1500, "📅", "i was there when it was written!"),
     ],
     "daily_streak": [
         (3,   "Three-Peat",       20,  "🔥", "تلاته - صفر لينا"),
         (7,   "Week Warrior",     50,  "🔥", "a week isn't for the weak"),
-        (30,  "Monthly Machine",  150, "🔥", "أنت واخدها تحدي شخصي بقا"),
-        (50,  "determined",       400, "🔥", "أنت لسه عايش يا بلدينا؟"),
-        (100, "Unstoppable",      1000, "🔥", "ميه ميه 😎"),
+        (14,  "determined",       150, "🔥", "أنت واخدها تحدي شخصي بقا"),
+        (30,  "Monthly Machine",  400, "🔥", "أنت لسه عايش يا بلدينا؟"),
+        (44,  "Unstoppable",      1000, "🔥", "مش هتشتكوني صح؟ 😃"),
     ],
     "achievement_collector": [
         # A meta-category: its threshold is checked against the total
@@ -1944,6 +1944,34 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
         _stat_add("achievements", len(unlocked))
     return unlocked
 
+def _backfill_xp_levels() -> int:
+    """One-time silent backfill: unlocks XP / Levels tiers (and the
+    achievement_collector count they feed) for users who already qualify.
+    No XP bonus is paid and nothing is announced. Idempotent."""
+    fixed = 0
+    tiers = ACHIEVEMENTS["xp_levels"]
+    for uid, entry in list(ANALYTICS.items()):
+        if not isinstance(entry, dict) or "xp" not in entry:
+            continue                                   # group/chat entries
+        try:
+            entry = _get_entry(int(uid))
+        except (ValueError, TypeError):
+            continue
+        before = entry["achievements"]["xp_levels"]
+        for i, (thr, *_rest) in enumerate(tiers):
+            val = entry.get("xp", 0) if i == 0 else entry.get("level", 0)
+            if val >= thr:
+                entry["achievements"]["xp_levels"] = max(entry["achievements"]["xp_levels"], i + 1)
+            else:
+                break
+        if entry["achievements"]["xp_levels"] != before:
+            _check_achievements(entry, "achievement_collector")   # silent: result discarded
+            fixed += 1
+    if fixed:
+        _mark_analytics_dirty()
+    print(f"XP/Levels backfill: {fixed} users updated.")
+    return fixed
+
 def _check_extra_achievement(entry: dict, key: str) -> dict | None:
     """Awards a one-off EXTRA_ACHIEVEMENTS entry if not already unlocked.
     Returns the same shape _check_achievements' list entries use (name,
@@ -2032,18 +2060,18 @@ async def _record_activity(user_id: int, questions_delta: int = 0,
 
     # ── XP for raw actions ───────────────────────────────────
     xp_earned = questions_delta * XP_PER_QUESTION
+    _lvl0 = entry["level"]
     new_level  = _award_xp(entry, xp_earned) if xp_earned else 0
 
     # ── achievement checks ───────────────────────────────────
     newly_unlocked = []
     newly_unlocked += _check_achievements(entry, "daily_streak")
+    newly_unlocked += _check_achievements(entry, "xp_levels")
     newly_unlocked += _check_achievements(entry, "achievement_collector")
 
     # level-up might also happen from achievement XP bonuses
-    final_level = _xp_to_level(entry["xp"])
-    if final_level > entry["level"]:
-        entry["level"] = final_level
-        new_level = final_level
+    if entry["level"] > _lvl0:   # _award_xp already moved it — compare with the level from before
+        new_level = entry["level"]
 
     if persist:
         await save_analytics()
@@ -4433,15 +4461,16 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         streak_broken=(not is_correct and prev_streak > 0),
     )
 
+    _lvl0 = user_entry["level"]   # level before ANY XP of this answer (achievement bonus XP included)
     events["achievements"] += _check_achievements(user_entry, "questions_answered")
     events["achievements"] += _check_achievements(user_entry, "correct_streak")
-    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
-
     _award_xp(user_entry, xp_delta)
-    final_level = _xp_to_level(user_entry["xp"])
-    if final_level > user_entry["level"]:
-        user_entry["level"] = final_level
-        events["level_up"] = final_level
+    # XP / Levels tiers (First XP, Level 5, 10, ...) — only checkable once this answer's XP is in
+    events["achievements"] += _check_achievements(user_entry, "xp_levels")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+    # _award_xp already moves entry["level"], so compare with the level from before the awards
+    if user_entry["level"] > _lvl0:
+        events["level_up"] = user_entry["level"]
     _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
@@ -4477,6 +4506,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
         user_entry["daily_quizzes_completed"] = user_entry.get("daily_quizzes_completed", 0) + 1
         _record_daily_personal_best(user_entry, _daily_module_for_year(year), correct, session["answered"], duration)
         _stat_daily_completed(correct, session["answered"])
+        _lvl0 = user_entry["level"]
         daily_events = _check_achievements(user_entry, "daily_quiz")
         if duration > 0 and duration < 60 and session["answered"] > 0 and pct == 100:
             ach = _check_extra_achievement(user_entry, "basmagy")
@@ -4487,12 +4517,9 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
             ach = _check_extra_achievement(user_entry, "insomniac")
             if ach:
                 daily_events.append(ach)
+        daily_events += _check_achievements(user_entry, "xp_levels")
         daily_events += _check_achievements(user_entry, "achievement_collector")
-        daily_level = 0
-        final_level = _xp_to_level(user_entry["xp"])
-        if final_level > user_entry["level"]:
-            user_entry["level"] = final_level
-            daily_level = final_level
+        daily_level = user_entry["level"] if user_entry["level"] > _lvl0 else 0
         _mark_analytics_dirty()
         await _announce_events(context, user_id, {"achievements": daily_events, "level_up": daily_level})
         await backup_analytics_to_channel(context)
@@ -5122,15 +5149,16 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
         streak_broken=(not is_correct and prev_streak > 0),
     )
 
+    _lvl0 = user_entry["level"]   # level before ANY XP of this answer (achievement bonus XP included)
     events["achievements"] += _check_achievements(user_entry, "questions_answered")
     events["achievements"] += _check_achievements(user_entry, "correct_streak")
-    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
-
     _award_xp(user_entry, xp_delta)
-    final_level = _xp_to_level(user_entry["xp"])
-    if final_level > user_entry["level"]:
-        user_entry["level"] = final_level
-        events["level_up"] = final_level
+    # XP / Levels tiers (First XP, Level 5, 10, ...) — only checkable once this answer's XP is in
+    events["achievements"] += _check_achievements(user_entry, "xp_levels")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+    # _award_xp already moves entry["level"], so compare with the level from before the awards
+    if user_entry["level"] > _lvl0:
+        events["level_up"] = user_entry["level"]
     _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
@@ -5284,15 +5312,16 @@ async def _advance_bookmarks_retake_session(context: ContextTypes.DEFAULT_TYPE, 
         streak_broken=(not is_correct and prev_streak > 0),
     )
 
+    _lvl0 = user_entry["level"]   # level before ANY XP of this answer (achievement bonus XP included)
     events["achievements"] += _check_achievements(user_entry, "questions_answered")
     events["achievements"] += _check_achievements(user_entry, "correct_streak")
-    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
-
     _award_xp(user_entry, xp_delta)
-    final_level = _xp_to_level(user_entry["xp"])
-    if final_level > user_entry["level"]:
-        user_entry["level"] = final_level
-        events["level_up"] = final_level
+    # XP / Levels tiers (First XP, Level 5, 10, ...) — only checkable once this answer's XP is in
+    events["achievements"] += _check_achievements(user_entry, "xp_levels")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+    # _award_xp already moves entry["level"], so compare with the level from before the awards
+    if user_entry["level"] > _lvl0:
+        events["level_up"] = user_entry["level"]
     _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
@@ -9204,6 +9233,7 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
         user_entry = _get_entry(user_id)
         user_entry["lectures_completed"] = user_entry.get("lectures_completed", 0) + 1
         _stat_lecture_finished(user_id)
+        _lvl0 = user_entry["level"]
         extra_events += _check_achievements(user_entry, "lectures_completed")
         started_at = session.get("started_at")
         if started_at is not None and (time.time() - started_at) <= 15 * 60:
@@ -9219,11 +9249,9 @@ async def _finish_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: i
             ach = _check_extra_achievement(user_entry, "insomniac")
             if ach:
                 extra_events.append(ach)
+        extra_events += _check_achievements(user_entry, "xp_levels")
         extra_events += _check_achievements(user_entry, "achievement_collector")
-        final_level = _xp_to_level(user_entry["xp"])
-        level_up = final_level if final_level > user_entry["level"] else 0
-        if level_up:
-            user_entry["level"] = final_level
+        level_up = user_entry["level"] if user_entry["level"] > _lvl0 else 0
         _mark_analytics_dirty()
         await _announce_events(context, user_id, {"achievements": extra_events, "level_up": level_up})
         await backup_analytics_to_channel(context)
@@ -9363,18 +9391,16 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         streak_broken=(not is_correct and prev_streak > 0),
     )
 
+    _lvl0 = user_entry["level"]   # level before ANY XP of this answer (achievement bonus XP included)
     events["achievements"] += _check_achievements(user_entry, "questions_answered")
     events["achievements"] += _check_achievements(user_entry, "correct_streak")
-    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
-
     _award_xp(user_entry, xp_delta)
-    # recompute from scratch rather than trust _award_xp's own return value —
-    # the achievement checks above may have just granted bonus XP of their
-    # own, so the true level-up (if any) has to account for all of it together
-    final_level = _xp_to_level(user_entry["xp"])
-    if final_level > user_entry["level"]:
-        user_entry["level"] = final_level
-        events["level_up"] = final_level
+    # XP / Levels tiers (First XP, Level 5, 10, ...) — only checkable once this answer's XP is in
+    events["achievements"] += _check_achievements(user_entry, "xp_levels")
+    events["achievements"] += _check_achievements(user_entry, "achievement_collector")
+    # _award_xp already moves entry["level"], so compare with the level from before the awards
+    if user_entry["level"] > _lvl0:
+        events["level_up"] = user_entry["level"]
     _mark_analytics_dirty()
     await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
 
@@ -11464,6 +11490,14 @@ def _event_hidden(ev: dict) -> bool:
     """A timed event whose results haven't been revealed yet."""
     return _event_is_timed(ev) and not ev.get("revealed")
 
+def _event_publish_reveal_note(ev: dict) -> str:
+    """A timed event published after its results time (or within 5 minutes of it) would reveal to nobody,
+    so its time moves to one hour after publishing. Returns a note for the admin ('' if nothing changed)."""
+    if not _event_hidden(ev) or (ev.get("reveal_at") or 0) > time.time() + 300:
+        return ""
+    ev["reveal_at"] = time.time() + 3600
+    return f"\n⚠️ وقت ظهور النتيجة كان قرّب/عدّى، فاتأجل ساعة: <b>{_event_reveal_text(ev['reveal_at'])}</b> (تقدر تفتحها قبلها من /edit_event ← ⏩ Reveal)."
+
 def _event_reveal_text(ts) -> str:
     try:
         return datetime.fromtimestamp(float(ts), DAILY_QUIZ_TZ).strftime("%Y-%m-%d %H:%M") + " (بتوقيت القاهرة)"
@@ -11700,6 +11734,7 @@ async def _event_publish(context, uid: int, au: dict):
         return None, "⚠️ لسه مفيش أسئلة اتسجلت — فوروارد Quiz poll أو ابعت سؤال مكتوب (إجابته مخفية بـ Spoiler) قبل ما تنشر."
     ev["live"] = True
     ev["published_at"] = time.time()
+    _reveal_note = _event_publish_reveal_note(ev)
     EVENT_AUTHORING.pop(uid, None)
     await _flush_sessions_if_changed()
     await backup_sessions_to_channel(context, force=True)
@@ -11708,7 +11743,7 @@ async def _event_publish(context, uid: int, au: dict):
         f"🚀 <b>{html.escape(ev['name'])}</b> اتنشر — {len(ev['questions'])} سؤال"
         + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + ".\n"
         f"زرار أخضر ظهر في أول القايمة الرئيسية لكل يوزرز {UNIVERSITIES.get(year_university(au['year']), '')} {year_label(au['year'])}.\n"
-        "لما تخلص استخدم /event_end."
+        "لما تخلص استخدم /event_end." + _reveal_note
     ), None
 
 EVENT_LB_USER_ROWS = 20    # rows per page (students and admins)
@@ -13702,11 +13737,12 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await send(text, markup)
             return True
         ev["live"], ev["published_at"] = True, time.time()
+        _reveal_note = _event_publish_reveal_note(ev)
         await _flush_sessions_if_changed()
         await backup_sessions_to_channel(context, force=True)
         await admin_log(context, "🚀 Event published", f"{html.escape(ev['name'])} — {year_label(ev['year'])} · {len(ev['questions'])} سؤال", uid)
         text, markup = _event_menu_view(eid, ev)
-        await send("🚀 اتنشر!\n\n" + text, markup)
+        await send("🚀 اتنشر!" + _reveal_note + "\n\n" + text, markup)
         return True
 
     return False
@@ -24299,6 +24335,7 @@ async def _post_init(app):
         await restore_quiz_from_channel(app, y)
     await _freeze_legacy_lecture_links(app)   # lecture uids + legacy-link table — see _lecture_uid
     await restore_analytics_from_channel(app)
+    _backfill_xp_levels()   # silent one-time catch-up of XP / Levels tiers
     await restore_settings_from_channel(app)
     await restore_lecture_results_from_channel(app)
     await restore_mistakes_bank_from_channel(app)
