@@ -12260,7 +12260,7 @@ async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
     practice = bool(s.get("practice"))   # a retry / mistakes run: never ranked, never locked
     if not custom and not practice:
         _event_save_result(ev, user_id, s)
-    elif custom:
+    elif custom and not s.get("retake"):
         await _custom_quiz_save(context, user_id, s)
     hidden = (not custom and not practice) and _event_hidden(ev)
     if hidden:
@@ -12289,6 +12289,8 @@ async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
     if practice:
         rank_line = "\n🔁 <i>تدريب — مش بيتحسب في الترتيب</i>"
     buttons = [] if custom else [[InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evtu_lb:{s['eid']}")]]
+    if custom and _custom_retake_stash(user_id, s, ev):   # 🔁 only when there's something to retake
+        buttons.append([InlineKeyboardButton("🔁 Retake mistakes", callback_data=CUSTOM_RETAKE_CB)])
     buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     try:
         await context.bot.send_message(
@@ -13237,6 +13239,65 @@ async def _custom_quiz_run(context, uid: int, st: dict, qs: list, n_lectures: in
     timer_line = f"\n⏱ {s['timer']} ثانية لكل سؤال" if s["timer"] else "\n⏱ من غير تايمر"
     grading_line = "\n🏁 التصحيح مرة واحدة في الآخر" if s["grading"] == "end" else "\n⚡ التصحيح أول بأول"
     await show(f"🎯 <b>Custom Quiz</b> — {len(qs)} سؤال من {n_lectures} محاضرة، هيتبعتولك واحد واحد 👇{timer_line}{grading_line}{short}")
+    if not await _event_send_next(context, uid, s):
+        EVENT_SESSIONS.pop(uid, None)
+        await context.bot.send_message(chat_id=uid, text="⚠️ معرفتش أبعت الأسئلة دلوقتي — جرّب تاني بعد شوية.")
+
+# ── 🔁 Custom Quiz: retake mistakes ─────────────────────────────────
+# A Custom Quiz run's event dict lives only on the session (popped when the run finishes), so the
+# questions a student missed are stashed here at the end — in memory, one entry per user, replaced by
+# the next run. A stale button after a restart just says the session ended.
+CUSTOM_RETAKE_CB = "cqrm"
+CUSTOM_RETAKE_POOL: dict = {}   # uid -> {"qs": [question dicts], "year", "timer", "grading"}
+
+def _custom_retake_stash(user_id: int, s: dict, ev: dict) -> bool:
+    """Keeps the questions this run was answered wrong (or timed out on). False if there are none."""
+    wrong = set(s.get("wrong_ids") or [])
+    qs = [copy.deepcopy(q) for q in (ev or {}).get("questions", []) if q.get("id") in wrong]
+    if not qs:
+        CUSTOM_RETAKE_POOL.pop(user_id, None)
+        return False
+    CUSTOM_RETAKE_POOL[user_id] = {
+        "qs": qs, "year": s.get("year") or ev.get("year"),
+        "timer": int(s.get("timer") or 0),
+        "grading": "live",   # a retake is always real quiz polls, so the right answer shows right after each tap
+    }
+    return True
+
+async def _custom_retake_callback(context, query) -> None:
+    uid = query.from_user.id
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+    pool = CUSTOM_RETAKE_POOL.get(uid)
+    if not pool or not pool.get("qs"):
+        await query.message.reply_text("⚠️ الجلسة انتهت — ابدأ Custom Quiz جديد.", reply_markup=home)
+        return
+    if uid in EVENT_SESSIONS:
+        await query.message.reply_text("⚠️ عندك كويز شغال دلوقتي — خلصه الأول.", reply_markup=home)
+        return
+    CUSTOM_RETAKE_POOL.pop(uid, None)   # one tap = one retake (a stale second tap can't start another run)
+    qs = pool["qs"]
+    for i, q in enumerate(qs, 1):
+        q["id"] = i
+    ev = {"name": "🔁 Custom Quiz — Mistakes", "year": pool["year"], "live": True, "questions": qs,
+          "next_qid": len(qs) + 1, "results": {}}
+    s = {
+        "eid": None, "ev": ev, "custom": True, "retake": True, "year": pool["year"], "prev_pct": 0,
+        "timer": pool["timer"], "grading": pool["grading"],
+        "queue": [q["id"] for q in qs],
+        "total": len(qs), "answered": 0, "correct": 0, "delivered": 0, "duration": 0.0, "started_at": time.time(),
+        "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
+    }
+    EVENT_SESSIONS[uid] = s
+    try:
+        await query.edit_message_reply_markup(reply_markup=home)   # the button can't be tapped twice
+    except Exception:
+        pass
+    timer_line = f"\n⏱ {s['timer']} ثانية لكل سؤال" if s["timer"] else "\n⏱ من غير تايمر"
+    grading_line = "\n🏁 التصحيح مرة واحدة في الآخر" if s["grading"] == "end" else "\n⚡ التصحيح أول بأول"
+    await context.bot.send_message(
+        chat_id=uid, parse_mode=ParseMode.HTML,
+        text=f"🔁 <b>Retake mistakes</b> — {len(qs)} سؤال من أخطاءك، هيتبعتولك واحد واحد 👇{timer_line}{grading_line}",
+    )
     if not await _event_send_next(context, uid, s):
         EVENT_SESSIONS.pop(uid, None)
         await context.bot.send_message(chat_id=uid, text="⚠️ معرفتش أبعت الأسئلة دلوقتي — جرّب تاني بعد شوية.")
@@ -16802,6 +16863,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if query.data.startswith("pk_"):
         await _picker_callback(update, context, query)
+        return
+    if query.data == CUSTOM_RETAKE_CB:
+        await _custom_retake_callback(context, query)
         return
 
     # ── /all_nicknames paging ──
