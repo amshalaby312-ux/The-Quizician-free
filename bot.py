@@ -24914,10 +24914,10 @@ async def _group_chat_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return   # a "Qz ..." message: let it through to quizzy_ask
     raise ApplicationHandlerStop
 
-app.add_handler(TypeHandler(Update, _group_chat_gate), group=-2)   # runs before the group=-1 gates
+app.add_handler(TypeHandler(Update, _group_chat_gate), group=-5)   # runs before the ban/onboarding/nickname gates
 
-app.add_handler(MessageHandler(filters.ALL, _ban_gate), group=-1)
-app.add_handler(CallbackQueryHandler(_ban_gate), group=-1)
+app.add_handler(MessageHandler(filters.ALL, _ban_gate), group=-4)   # one gate per group: PTB runs only the first matching handler in a group
+app.add_handler(CallbackQueryHandler(_ban_gate), group=-4)
 
 async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Same group=-1 pattern as _ban_gate, registered right after it, so
@@ -24942,7 +24942,7 @@ async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.callback_query:
         data = update.callback_query.data or ""
-        if data.startswith(("onboard_uni:", "onboard_yc:", "onboard_bully:")) or data in ("onboard_how", "onboard_where", "onboard_go"):
+        if data.startswith(("onboard_uni:", "onboard_yc:", "onboard_bully:")) or data in ("onboard_how", "onboard_where", "onboard_go", "fix_nick"):
             return
 
     if get_nickname(real_uid) is not None and get_year_class(real_uid) in YEAR_CLASS_NUMBER:
@@ -24955,8 +24955,8 @@ async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(text)
     raise ApplicationHandlerStop
 
-app.add_handler(MessageHandler(filters.ALL, _onboarding_gate), group=-1)
-app.add_handler(CallbackQueryHandler(_onboarding_gate), group=-1)
+app.add_handler(MessageHandler(filters.ALL, _onboarding_gate), group=-3)
+app.add_handler(CallbackQueryHandler(_onboarding_gate), group=-3)
 
 # ── Bad-nickname gate ─────────────────────────────────────────────
 # People who registered before the nickname rules (fewer than NICKNAME_MIN_LETTERS letters, or
@@ -25012,8 +25012,8 @@ async def _nickname_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat.id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
     raise ApplicationHandlerStop
 
-app.add_handler(MessageHandler(filters.ALL, _nickname_gate), group=-1)
-app.add_handler(CallbackQueryHandler(_nickname_gate), group=-1)
+app.add_handler(MessageHandler(filters.ALL, _nickname_gate), group=-2)
+app.add_handler(CallbackQueryHandler(_nickname_gate), group=-2)
 
 async def _poll_answer_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Poll answers skip the message/callback gates above, so someone
