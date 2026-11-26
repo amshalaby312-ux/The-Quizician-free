@@ -1706,6 +1706,30 @@ def _lb_nav_row(prefix: str, page: int, pages: int) -> list:
         row.append(InlineKeyboardButton("➡️ Next", callback_data=f"{prefix}:{page + 1}"))
     return row
 
+# ── Shared leaderboard row ──────────────────────────────────────────
+# Every board renders each entry the same way: the rank + nickname + level/title in a quote block,
+# and the stats on the line under it:
+#     ▌🥇 Farah Level 0 - Beginner
+#     — 23/23 · ⏱️ 1m 37s
+# LB_LTR is an invisible left-to-right mark put first in the quote and the stats line, so an Arabic
+# nickname doesn't flip the whole line to right-to-left (the rank/medal would jump to the wrong side).
+LB_LTR = "\u200e"
+_LB_MEDALS = {0: "🥇", 1: "🥈", 2: "🥉"}
+
+def _lb_level_label(uid) -> str:
+    try:
+        level = int((ANALYTICS.get(str(uid), {}) or {}).get("level", 0) or 0)
+    except (TypeError, ValueError):
+        level = 0
+    return f"Level {level} - {_level_title(level)}"
+
+def _lb_row(index: int, name: str, uid, stats: str) -> str:
+    """One leaderboard entry. `index` is the 0-based position on the whole board (not the page);
+    the top three get medals, everyone else "N."."""
+    rank = _LB_MEDALS.get(index, f"{index + 1}.")
+    return (f"<blockquote>{LB_LTR}{rank} {html.escape(str(name))} {html.escape(_lb_level_label(uid))}</blockquote>"
+            f"{LB_LTR}— {stats}")
+
 def _year_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
     """Top users in one Year/Class cohort (SETTINGS' year_class — see the
     onboarding question, NOT the quiz-browsing YEARS), ranked by all-time
@@ -2534,6 +2558,21 @@ _VULGAR_WORDS_AR = {
 # Precomputed once so every nickname check just does plain substring
 # lookups against already-normalized sets.
 _VULGAR_WORDS_AR_NORM = {_normalize_for_filter(w) for w in _VULGAR_WORDS_AR}
+
+NICKNAME_MIN_LETTERS = 3
+
+def _count_nickname_letters(text: str) -> int:
+    """Real letters only (any script — Arabic, Latin, ...): digits, punctuation, emojis, spaces and
+    the Arabic tatweel (ـ, which Unicode files as a letter but is just a stretch mark) don't count."""
+    return sum(1 for ch in text if ch != "\u0640" and unicodedata.category(ch).startswith("L"))
+
+def _nickname_problem(nickname: str) -> str | None:
+    """None if the nickname is acceptable, else the reply to show. At least NICKNAME_MIN_LETTERS
+    letters means "..." / emoji-only / symbol-only names are rejected too, while "Ahmed 😎" is fine."""
+    if _count_nickname_letters(nickname) < NICKNAME_MIN_LETTERS:
+        return (f"⚠️ الاسم لازم يكون فيه {NICKNAME_MIN_LETTERS} حروف على الأقل "
+                "(مش نقط ولا إيموجي لوحدهم) — جرب تاني.")
+    return None
 
 def _contains_vulgar_word(text: str) -> bool:
     """True if `text` (an attempted nickname) contains a blocked English
@@ -4572,11 +4611,8 @@ async def show_daily_quiz_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int,
         medal = {0: "🥇", 1: "🥈", 2: "🥉"}
         lines = [board_title, ""]
         for i, r in enumerate(rows[p_start:p_end], p_start):
-            rank = medal.get(i, f"{i + 1}.")
-            lines.append(
-                f"{rank} {html.escape(r['name'])} — "
-                f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
-            )
+            lines.append(_lb_row(i, r["name"], r["user_id"],
+                                 f"{r['correct']}/{r['total']} · ⏱️ {_format_duration(r['duration'])}"))
         board_text = "\n".join(lines)
 
     board_text = f"{quizzy_block(QUIZZY_READY_ART, 'CHALLENGE YOURSELF!')}\n\n{board_text}"
@@ -4892,19 +4928,85 @@ def _live_streak(entry: dict) -> int:
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
     return int(entry.get("streak", 0) or 0) if last in (today, yesterday) else 0
 
-def _daily_push_text(uid: int) -> str:
+def _daily_content_blocks(year: str | None) -> list:
+    """[(module, subject, [(lecture_key, label), ...]), ...] — the lectures today's Daily Quiz
+    draws from for this year: the /daily_module scope (and its picked lectures, if any) or the
+    year's default active module (same rule as _daily_quiz_subject_pool). Subjects with no ready
+    lecture are skipped. `label` matches the lecture buttons ("Lecture N: name")."""
+    if not year or year not in QUIZ_INDEX:
+        return []
+    scope = get_daily_quiz_scope(year)
+    module = scope["module"] if scope else DAILY_QUIZ_ACTIVE_MODULE.get(year)
+    uids = frozenset(scope.get("lectures") or ()) if scope else frozenset()
+
+    def _collect(only: frozenset) -> list:
+        blocks = []
+        for mod in ([module] if module else ready_modules(year)):
+            for subject in ready_subjects(year, mod):
+                lecs = []
+                for key in ready_lecture_keys(year, mod, subject):
+                    v = QUIZ_INDEX[year][key]
+                    if only and v.get("uid") not in only:
+                        continue
+                    lecs.append((key, f"Lecture {v.get('lecture_number') or (len(lecs) + 1)}: {v.get('name') or key}"))
+                if lecs:
+                    blocks.append((mod, subject, lecs))
+        return blocks
+
+    blocks = _collect(uids)
+    if not blocks and uids:
+        blocks = _collect(frozenset())   # picked lectures are gone — whole module, like the pool does
+    return blocks
+
+def _daily_push_text(uid: int, blocks_cache: dict | None = None) -> str:
     entry = _get_entry(uid)
-    module = _daily_module_for_year(get_year_class(uid))
+    year = get_year_class(uid)
+    module = _daily_module_for_year(year)
     rec = (entry.get("daily_records") or {}).get(module, {}) if module else {}
     fastest = rec.get("fastest")
     best_c, best_t = rec.get("best_correct"), rec.get("best_total")
     streak = _live_streak(entry)
-    return (
+    medals = entry.get("daily_medals") or {}
+
+    head = (
         "💥 <b>Daily Quiz</b> !الكويز اليومي أتجدد 🎉\n\n"
-        f"🔥 الستريك بتاع: <b>{streak}</b>\n"
+        f"🔥 الستريك بتاعك: <b>{streak}</b>\n"
         f"⏱ أسرع زمن ليك فالموديول ده: <b>{_format_duration(fastest) if fastest else '—'}</b>\n"
-        f"🏆 أعلى درجة جبتها: <b>{f'{best_c}/{best_t}' if best_t else '—'}</b>"
+        f"🏆 أعلى درجة جبتها: <b>{f'{best_c}/{best_t}' if best_t else '—'}</b>\n"
+        f"🏅 ماديلياتك: 🥇({medals.get('gold', 0)}) 🥈({medals.get('silver', 0)}) 🥉({medals.get('bronze', 0)})"
     )
+
+    try:
+        # the structure doesn't depend on the user, so the push job builds it once per year
+        if blocks_cache is not None and year in blocks_cache:
+            blocks = blocks_cache[year]
+        else:
+            blocks = _daily_content_blocks(year)
+            if blocks_cache is not None:
+                blocks_cache[year] = blocks
+        if not blocks:
+            return head
+
+        lines, used = [], 0
+        budget = 3800 - len(head)   # Telegram's 4096 cap, with room to spare
+        for mod, subject, lecs in blocks:
+            title = subject_label(subject) if module else f"{mod} · {subject_label(subject)}"
+            block = [f"<b>{html.escape(title)}</b>"]
+            for key, label in lecs:
+                done = str(uid) in LECTURE_RESULTS.get(_lr_key(year, key), {})
+                block.append(f"{'✅ ' if done else ''}{html.escape(label)}")
+            size = sum(len(x) + 1 for x in block) + 1
+            if used + size > budget:
+                lines.append("…")
+                break
+            lines.extend(block + [""])
+            used += size
+        while lines and lines[-1] == "":
+            lines.pop()
+        return head + "\n\n📚 <b>المحتوى:</b>\n<blockquote>" + "\n".join(lines) + "</blockquote>"
+    except Exception as e:
+        print(f"Daily push content list failed: {e}")
+        return head   # never block the push because of the extra list
 
 async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
     """The 2pm-Cairo push (see job_queue.run_daily in MAIN): just a
@@ -4919,13 +5021,14 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
     finishers get their medal exactly when the new quiz appears, instead
     of whenever someone next happens to open the leaderboard screen."""
     _ensure_daily_leaderboard_fresh()   # day just rolled: awards medals for the outgoing board, starts a fresh one
+    blocks_cache: dict = {}   # year -> content list, shared by every user of that year in this push
     for uid in list(USERS):
         if not get_daily_notifs_enabled(uid):
             continue
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text=_daily_push_text(uid),
+                text=_daily_push_text(uid, blocks_cache),
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
@@ -7533,6 +7636,16 @@ async def deliver_quiz(
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARD HELPERS
 # ═══════════════════════════════════════════════════════════════
+OFFICIAL_CHANNEL_URL = "https://t.me/TheQuizicianOfficial"
+
+def _daily_menu_button(user_id: int | None) -> InlineKeyboardButton:
+    """💥Daily Quiz💥 — Telegram's green button until the user has taken today's quiz (same
+    once-per-day check the Daily Quiz hub uses), the normal button after."""
+    done = user_id is not None and get_daily_quiz_last_date(user_id) == _daily_quiz_day()
+    if done:
+        return InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz")
+    return _event_green_button("💥Daily Quiz💥", "daily_quiz")
+
 def start_menu_keyboard(user_id: int | None = None):
     _event_rows = _event_menu_rows(user_id)   # green /event_start buttons, on top
     _pause_rows = _paused_lecture_menu_rows(user_id)   # blue "Resume (<lecture>)", above everything
@@ -7547,7 +7660,7 @@ def start_menu_keyboard(user_id: int | None = None):
         ],
         [
             InlineKeyboardButton("❤️ Bookmarks", callback_data="menu_bookmarks"),
-            InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
+            _daily_menu_button(user_id),
         ],
         [
             InlineKeyboardButton("🧠 Mistakes Bank", callback_data="mistakes_bank_menu"),
@@ -7557,6 +7670,9 @@ def start_menu_keyboard(user_id: int | None = None):
         ],
         [
             InlineKeyboardButton("🎯 Custom Quiz", callback_data="custom_quiz"),
+        ],
+        [
+            InlineKeyboardButton("The Official Channel", url=OFFICIAL_CHANNEL_URL),
         ],
     ])
 
@@ -11282,6 +11398,7 @@ async def event_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_EVENT_EDIT.pop(uid, None)
     AWAITING_EVENT_DESC.pop(uid, None)
     AWAITING_EVENT_LEVEL.pop(uid, None)
+    AWAITING_EVENT_REVEAL.pop(uid, None)
     AWAITING_EVENT_NAME[uid] = True
     await update.message.reply_text(
         "<b>Event Start</b>\n\n"
@@ -11307,6 +11424,77 @@ def _event_is_once(ev: dict) -> bool:
     return (ev or {}).get("attempts") == "once"
 
 AWAITING_EVENT_LEVEL: dict = {}   # admin uid -> True while /event_start waits for the minimum level
+AWAITING_EVENT_REVEAL: dict = {}  # admin uid -> True while /event_start waits for the results time
+
+# ── Correction method of an event (/event_start step "تحب التصحيح يكون أزاي؟") ──
+#   live  : ⚡ right after each answer (the usual quiz poll)
+#   end   : 🏁 plain polls, everything graded once at the end (+ a review of the mistakes)
+#   timed : ⏳ plain polls; nothing is shown when a student finishes — results, rank and leaderboard
+#           appear for everyone at the time the admin picked (ev["reveal_at"], Cairo time), pushed by
+#           _event_reveal_job. After that anyone can retry as often as they like (practice runs, not
+#           ranked) and picks live / end for every retry. Older events have no field = live.
+_EVENT_GRADING_PROMPT = (
+    "✅ <b>تحب التصحيح يكون أزاي؟</b>\n\n"
+    "⚡ <b>علطول أول بأول</b> — الإجابة الصح بتظهر بعد كل سؤال.\n"
+    "🏁 <b>مرة واحدة في الآخر</b> — النتيجة والمراجعة بعد آخر سؤال.\n"
+    "⏳ <b>بعد وقت معين</b> — محدش يشوف نتيجته لما يخلص، والنتيجة والترتيب بيظهروا للكل في الوقت اللي تحدده، "
+    "وبعدها أي حد يقدر يعيد الـ Event براحته ويختار طريقة التصحيح."
+)
+
+def _event_grading_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ علطول أول بأول", callback_data="evta_gm:live")],
+        [InlineKeyboardButton("🏁 مرة واحدة في الآخر", callback_data="evta_gm:end")],
+        [InlineKeyboardButton("⏳ بعد وقت معين", callback_data="evta_gm:timed")],
+    ])
+
+_EVENT_REVEAL_PROMPT = (
+    "⏳ <b>إمتى النتيجة تظهر؟</b> (بتوقيت القاهرة)\n\n"
+    "ابعت الوقت بأي شكل من دول:\n"
+    "• <code>21:30</code> — أقرب 9:30 م جاية\n"
+    "• <code>28/11 21:30</code> — يوم وساعة\n"
+    "• <code>2026-11-28 21:30</code>\n"
+    "• <code>+3h</code> / <code>+90m</code> / <code>+2d</code> — بعد كذا من دلوقتي"
+)
+
+def _event_is_timed(ev: dict) -> bool:
+    return (ev or {}).get("grading") == "timed"
+
+def _event_hidden(ev: dict) -> bool:
+    """A timed event whose results haven't been revealed yet."""
+    return _event_is_timed(ev) and not ev.get("revealed")
+
+def _event_reveal_text(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), DAILY_QUIZ_TZ).strftime("%Y-%m-%d %H:%M") + " (بتوقيت القاهرة)"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "—"
+
+def _parse_event_reveal_time(text: str) -> float | None:
+    """Cairo-time text -> unix time, or None if it isn't understood or is already (almost) past."""
+    t = (text or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    now = datetime.now(DAILY_QUIZ_TZ)
+    target = None
+    try:
+        m = re.fullmatch(r"\+\s*(\d+)\s*([hmdHMD])", t)
+        if m:
+            n, unit = int(m.group(1)), m.group(2).lower()
+            target = now + (timedelta(hours=n) if unit == "h" else timedelta(minutes=n) if unit == "m" else timedelta(days=n))
+        elif (m := re.fullmatch(r"(\d{1,2}):(\d{2})", t)):
+            target = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+            if target <= now + timedelta(seconds=60):
+                target += timedelta(days=1)
+        elif (m := re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})", t)):
+            target = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), tzinfo=DAILY_QUIZ_TZ)
+        elif (m := re.fullmatch(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", t)):
+            target = datetime(now.year, int(m.group(2)), int(m.group(1)), int(m.group(3)), int(m.group(4)), tzinfo=DAILY_QUIZ_TZ)
+            if target <= now:
+                target = target.replace(year=now.year + 1)
+    except ValueError:
+        return None
+    if target is None or target <= now + timedelta(seconds=30):
+        return None
+    return target.timestamp()
 
 _EVENT_LEVEL_PROMPT = (
     "🎚 <b>أقل Level يقدر يدخل الـ Event؟</b>\n\n"
@@ -11366,7 +11554,11 @@ async def _event_begin(context, uid: int, year: str, send) -> None:
         "created_at": time.time(), "questions": [], "results": {},
         "attempts": pick.get("attempts") or "unlocked",   # "once" | "unlocked"
         "min_level": int(pick.get("min_level") or 0),     # 0 = no requirement
+        "grading": pick.get("grading") or "live",         # "live" | "end" | "timed" (see _EVENT_GRADING_PROMPT)
     }
+    if ev["grading"] == "timed":
+        ev["reveal_at"] = float(pick.get("reveal_at") or 0) or (time.time() + 3600)
+        ev["revealed"] = False
     eid = _event_uid(ev)
     while eid in EVENTS:   # ids are random; this is just a collision guard
         ev.pop("uid", None)
@@ -11569,8 +11761,8 @@ def _event_leaderboard_text(ev: dict, page: int = 0, viewer: int | None = None) 
     medal = {0: "🥇", 1: "🥈", 2: "🥉"}
     lines = [title, ""]
     for i, r in enumerate(ranked[p_start:p_end], p_start):
-        lines.append(f"{medal.get(i, f'{i + 1}.')} {html.escape(r['name'])} — "
-                     f"{r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}")
+        lines.append(_lb_row(i, r["name"], r["user_id"],
+                             f"{r['correct']}/{r['total']} · ⏱️ {_format_duration(r['duration'])}"))
     lines += ["", f"👥 {len(ranked)} خلصوه"]
     if viewer is not None:
         pos = next((i for i, r in enumerate(ranked, 1) if r["user_id"] == viewer), None)
@@ -11636,6 +11828,20 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await send("⚠️ الجلسة انتهت — ابدأ من /event_start تاني.")
             return
         EVENT_PICK[uid]["min_level"] = 0
+        await send(_EVENT_GRADING_PROMPT, _event_grading_markup())
+        return
+
+    if data.startswith("evta_gm:"):
+        gm = data.split(":", 1)[1]
+        if uid not in EVENT_PICK or gm not in ("live", "end", "timed"):
+            await send("⚠️ الجلسة انتهت — ابدأ من /event_start تاني.")
+            return
+        EVENT_PICK[uid]["grading"] = gm
+        EVENT_PICK[uid].pop("reveal_at", None)
+        if gm == "timed":
+            AWAITING_EVENT_REVEAL[uid] = True
+            await send(_EVENT_REVEAL_PROMPT)
+            return
         await _event_pick_step(context, uid, None, send)
         return
 
@@ -11667,6 +11873,7 @@ async def _event_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "evta_cancel":
         AWAITING_EVENT_LEVEL.pop(uid, None)
+        AWAITING_EVENT_REVEAL.pop(uid, None)
         PICKER.pop(uid, None)
         au = EVENT_AUTHORING.pop(uid, None)
         if not au:
@@ -11834,6 +12041,8 @@ async def _event_advance(context, user_id: int, s: dict, is_correct: bool, chose
             "right": opts[c["correct"]] if isinstance(c.get("correct"), int) and 0 <= c["correct"] < len(opts) else None,
         })
     s["answered"] += 1
+    if not is_correct and isinstance(s.get("current_q"), int):
+        s.setdefault("wrong_ids", []).append(s["current_q"])   # 🔁 Retake mistakes uses these
     _t0 = s.pop("q_sent_at", None)
     if _t0:   # run time = sum of the time spent on each poll (written questions / idling don't count)
         s["duration"] = s.get("duration", 0.0) + max(0.0, time.time() - _t0)
@@ -11984,6 +12193,7 @@ def _event_save_result(ev: dict, user_id: int, s: dict) -> None:
     new = {
         "user_id": user_id, "name": get_nickname(user_id), "correct": s["correct"],
         "answered": s["answered"], "total": s["total"], "duration": round(s.get("duration", 0.0), 1),
+        "wrong": list(s.get("wrong_ids") or []),
     }
     prev = ev.setdefault("results", {}).get(str(user_id))
     if prev is None or (new["correct"], -new["duration"]) > (prev.get("correct", 0), -(prev.get("duration") or 0.0)):
@@ -12000,40 +12210,60 @@ async def _event_proceed_after_written(context, user_id: int, s: dict) -> None:
         return
     await _event_finish(context, user_id, s, ev)
 
+def _event_stats_text(name: str, correct: int, answered: int, total: int, duration: float) -> str:
+    pct = round(correct / answered * 100) if answered else 0
+    return (
+        f"<b>خلصت {html.escape(name)}!</b>\n\n"
+        f"✅ صح: {correct}\n❌ غلط: {answered - correct}\n"
+        f"📊 نسبة: {pct}%\n📝 عدد الأسئلة: {answered}/{total}\n"
+        f"⏱️ الوقت: {_format_duration(duration)}"
+    )
+
 async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
     EVENT_SESSIONS.pop(user_id, None)
     custom = bool(s.get("custom"))
-    total, correct = s["total"], s["correct"]
-    pct = round(correct / s["answered"] * 100) if s["answered"] else 0
-    if not custom:
+    practice = bool(s.get("practice"))   # a retry / mistakes run: never ranked, never locked
+    if not custom and not practice:
         _event_save_result(ev, user_id, s)
-    else:
+    elif custom:
         await _custom_quiz_save(context, user_id, s)
+    hidden = (not custom and not practice) and _event_hidden(ev)
+    if hidden:
+        # ⏳ timed event: nothing about the score is shown yet — _event_reveal sends it at ev["reveal_at"]
+        try:
+            await context.bot.send_message(
+                chat_id=user_id, parse_mode=ParseMode.HTML,
+                text=(f"✅ <b>خلصت {html.escape(ev['name'])}!</b>\n\n"
+                      "إجاباتك اتسجّلت 👌\n"
+                      f"⏳ النتيجة والترتيب هيظهروا: <b>{_event_reveal_text(ev.get('reveal_at'))}</b>\n"
+                      "هتوصلك رسالة هنا أول ما يتفتحوا."),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]]),
+            )
+        except Exception:
+            pass
+        await _event_persist_safe(context)
+        return
     rank_line = ""
     if custom and s["answered"] and s.get("duration"):
         rank_line = f"\n⚡ السرعة: {s['duration'] / s['answered']:.1f} ثانية/سؤال"
-    if not custom:
+    if not custom and not practice:
         _ranked = _event_rank(ev, limit=None)
         _pos = next((i for i, r in enumerate(_ranked, 1) if r["user_id"] == user_id), None)
         if _pos:
             rank_line = f"\n🏅 ترتيبك: <b>#{_pos}</b> من {len(_ranked)}"
+    if practice:
+        rank_line = "\n🔁 <i>تدريب — مش بيتحسب في الترتيب</i>"
     buttons = [] if custom else [[InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evtu_lb:{s['eid']}")]]
     buttons.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     try:
         await context.bot.send_message(
             chat_id=user_id, parse_mode=ParseMode.HTML,
-            text=(
-                f"<b>خلصت {html.escape(ev['name'])}!</b>\n\n"
-                f"✅ صح: {correct}\n❌ غلط: {s['answered'] - correct}\n"
-                f"📊 نسبة: {pct}%\n📝 عدد الأسئلة: {s['answered']}/{total}\n"
-                f"⏱️ الوقت: {_format_duration(s.get('duration', 0.0))}"
-                + rank_line
-            ),
+            text=_event_stats_text(ev["name"], s["correct"], s["answered"], s["total"], s.get("duration", 0.0)) + rank_line,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     except Exception:
         pass
-    if custom and s.get("grading") == "end":
+    if s.get("grading") == "end":
         for _m in _event_review_messages(s):
             try:
                 await context.bot.send_message(chat_id=user_id, text=_m, parse_mode=ParseMode.HTML)
@@ -12041,6 +12271,49 @@ async def _event_finish(context, user_id: int, s: dict, ev: dict) -> None:
                 print(f"EVENT: couldn't send the review to {user_id}: {e}")
     if not custom:
         await _event_persist_safe(context)
+
+# ── ⏳ timed events: the reveal ──────────────────────────────────────
+async def _event_reveal(context, eid: str, ev: dict) -> int:
+    """Opens a timed event's results: flags it revealed first (so a restart can't send twice), then DMs
+    every student who finished — 🎉 Congratulations!! / rank / the usual stats / 🔁 Retake mistakes +
+    🏆 Leaderboard. Returns how many were sent."""
+    ev["revealed"] = True
+    ev["revealed_at"] = time.time()
+    await _event_persist_safe(context)
+    ranked = _event_rank(ev, limit=None)
+    sent = 0
+    for pos, r in enumerate(ranked, 1):
+        uid = r["user_id"]
+        wrong_left = [q for q in (ev.get("questions") or []) if q.get("id") in set(r.get("wrong") or [])]
+        rows = []
+        if wrong_left:
+            rows.append(InlineKeyboardButton("🔁 Retake mistakes", callback_data=f"evtu_rm:{eid}"))
+        rows.append(InlineKeyboardButton("🏆 Leaderboard", callback_data=f"evtu_lb:{eid}"))
+        try:
+            await context.bot.send_message(
+                chat_id=uid, parse_mode=ParseMode.HTML,
+                text=(f"🎉 <b>Congratulations!!</b>\nyou came <b>#{pos}</b> من {len(ranked)}\n\n"
+                      + _event_stats_text(ev["name"], r["correct"], r.get("answered", r["total"]), r["total"], r["duration"])),
+                reply_markup=InlineKeyboardMarkup([rows]),
+            )
+            sent += 1
+        except Exception:
+            pass   # blocked the bot, deactivated account, ... — skip
+        await asyncio.sleep(0.05)
+    return sent
+
+async def _event_reveal_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repeating job (see MAIN): reveals every live timed event whose time has come. Restart-safe — it
+    just looks at the saved events, so one that came due while the bot was down opens on the next tick."""
+    now = time.time()
+    for eid, ev in list(EVENTS.items()):
+        try:
+            if (_event_hidden(ev) and ev.get("live") and not ev.get("ended")
+                    and (ev.get("reveal_at") or 0) <= now):
+                n = await _event_reveal(context, eid, ev)
+                await admin_log(context, "⏳ Event results revealed", f"{html.escape(ev['name'])} — {n} طالب اتبعتلهم النتيجة", ev.get("created_by") or 0)
+        except Exception as e:
+            print(f"EVENT REVEAL ERROR ({eid}): {e}")
 
 def _event_uid(ev: dict) -> str:
     """Stable random id for one event (assigned lazily for older events) —
@@ -12081,7 +12354,11 @@ def _event_preview_view(eid: str, user_id: int, token: str | None = None):
         lines += ["", ev["description"]]   # stored as Telegram-HTML (formatting kept)
     _n_w = _event_written_count(ev)
     lines += ["", f"📝 {len(ev['questions'])} سؤال" + (f" + ✍️ {_n_w} مكتوب" if _n_w else "")]
-    once = _event_is_once(ev)
+    if _event_hidden(ev):
+        lines += ["", f"⏳ النتيجة والترتيب هيظهروا: <b>{_event_reveal_text(ev.get('reveal_at'))}</b>"]
+    elif _event_is_timed(ev):
+        lines += ["", "🔓 النتيجة ظهرت — تقدر تعيد الـ Event براحتك وتختار طريقة التصحيح (تدريب، مش بيتحسب في الترتيب)."]
+    once = _event_is_once(ev) and not (_event_is_timed(ev) and ev.get("revealed"))
     used = once and str(user_id) in (ev.get("taken") or {})
     need = _event_min_level(ev)
     locked = need > _event_user_level(user_id)
@@ -12126,6 +12403,16 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if not ev or get_year_class(uid) != ev.get("year"):
             await query.edit_message_text("⚠️ الـ Event ده خلص أو مش متاح ليك.", reply_markup=home)
             return
+        if _event_hidden(ev):
+            await query.edit_message_text(
+                f"🏆 الـ leaderboard هيظهر: <b>{_event_reveal_text(ev.get('reveal_at'))}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 رجوع", callback_data=f"evtu_open:{eid}")],
+                    [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")],
+                ]),
+            )
+            return
         _text, _page, _pages = _event_leaderboard_text(ev, int(_pg) if _pg.isdigit() else 0, viewer=uid)
         _nav = _lb_nav_row(f"evtu_lb:{eid}", _page, _pages)
         await query.edit_message_text(
@@ -12155,6 +12442,9 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode=ParseMode.HTML,
         )
         return
+    if action in ("evtu_rm", "evtu_pr"):
+        await _event_practice_callback(update, context, query, action, eid, _pg)
+        return
     if action != "evtu_go":
         return
     ev = EVENTS.get(eid)
@@ -12166,6 +12456,13 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             f"🔒 الـ Event ده لـ <b>Level {_event_min_level(ev)}</b> وأعلى — انت Level {_event_user_level(uid)}.",
             parse_mode=ParseMode.HTML, reply_markup=home,
+        )
+        return
+    if _event_is_timed(ev) and ev.get("revealed"):
+        # results are out: anyone can retry as much as they like — pick the correction method first
+        await query.edit_message_text(
+            f"<b>{html.escape(ev['name'])}</b>\n\n{_EVENT_GRADING_PROMPT.split(chr(10) + chr(10))[0]}",
+            parse_mode=ParseMode.HTML, reply_markup=_event_practice_method_markup(eid, "all"),
         )
         return
     if _event_is_once(ev):
@@ -12196,6 +12493,8 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "eid": eid, "year": ev["year"], "queue": queue, "total": n_polls, "answered": 0, "correct": 0,
         "delivered": 0, "duration": 0.0, "started_at": time.time(),
         "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
+        # 🏁 and ⏳ events use plain polls graded at the end (see _event_send_next / _event_advance)
+        "grading": "end" if ev.get("grading") in ("end", "timed") else "live",
     }
     EVENT_SESSIONS[uid] = s
     await query.edit_message_text(
@@ -12205,6 +12504,85 @@ async def _event_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _event_send_next(context, uid, s):
         EVENT_SESSIONS.pop(uid, None)
         await context.bot.send_message(chat_id=uid, text="⚠️ معرفتش أبعت أسئلة الـ Event دلوقتي — جرّب تاني بعد شوية.")
+
+def _event_practice_method_markup(eid: str, kind: str) -> InlineKeyboardMarkup:
+    """⚡ / 🏁 chooser shown before a retry (kind "all") or a mistakes retake (kind "mis")."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ علطول أول بأول", callback_data=f"evtu_pr:{eid}:{kind}:0")],
+        [InlineKeyboardButton("🏁 مرة واحدة في الآخر", callback_data=f"evtu_pr:{eid}:{kind}:1")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data=f"evtu_open:{eid}")],
+    ])
+
+async def _event_practice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, query, action: str, eid: str, rest: str) -> None:
+    """evtu_rm:<eid> (🔁 Retake mistakes -> method chooser) and evtu_pr:<eid>:<all|mis>:<0|1> (start the
+    practice run). Only for timed events whose results are out. Practice runs are never ranked."""
+    uid = query.from_user.id
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
+    ev = EVENTS.get(eid)
+    if (not ev or not ev.get("live") or ev.get("ended") or not _event_is_timed(ev) or not ev.get("revealed")
+            or get_year_class(uid) != ev.get("year")):
+        await query.edit_message_text("⚠️ الـ Event ده خلص أو مش متاح ليك.", reply_markup=home)
+        return
+    if _event_min_level(ev) > _event_user_level(uid):
+        await query.edit_message_text(
+            f"🔒 الـ Event ده لـ <b>Level {_event_min_level(ev)}</b> وأعلى — انت Level {_event_user_level(uid)}.",
+            parse_mode=ParseMode.HTML, reply_markup=home,
+        )
+        return
+    mine = (ev.get("results") or {}).get(str(uid)) or {}
+    wrong_ids = set(mine.get("wrong") or [])
+    if action == "evtu_rm":
+        if not [q for q in ev["questions"] if q.get("id") in wrong_ids]:
+            await query.edit_message_text("🎉 مفيش أخطاء تعيدها!", reply_markup=home)
+            return
+        await query.edit_message_text(
+            f"<b>{html.escape(ev['name'])}</b> — 🔁 Retake mistakes\n\n✅ <b>تحب التصحيح يكون أزاي؟</b>",
+            parse_mode=ParseMode.HTML, reply_markup=_event_practice_method_markup(eid, "mis"),
+        )
+        return
+    parts = rest.split(":")
+    if len(parts) != 2 or parts[0] not in ("all", "mis") or parts[1] not in ("0", "1"):
+        return
+    kind, grading = parts[0], ("end" if parts[1] == "1" else "live")
+    if uid in EVENT_SESSIONS:
+        await query.edit_message_text("⚠️ عندك Event شغال دلوقتي — خلصه الأول.", reply_markup=home)
+        return
+    _event_ensure_ids(ev)
+    if kind == "mis":
+        qs = [copy.deepcopy(q) for q in ev["questions"] if q.get("id") in wrong_ids]
+        if not qs:
+            await query.edit_message_text("🎉 مفيش أخطاء تعيدها!", reply_markup=home)
+            return
+        pev = {"name": f"{ev['name']} — Mistakes", "year": ev["year"], "live": True, "questions": qs,
+               "next_qid": max(q["id"] for q in qs) + 1, "results": {}}
+        queue = [q["id"] for q in qs]
+        s_ev, title = pev, f"🔁 <b>{html.escape(ev['name'])}</b> — {len(qs)} سؤال من أخطاءك"
+    else:
+        queue = []
+        for _q in ev["questions"]:
+            for _w in (_q.get("written") or []):
+                queue.append({"type": "written", "data": _w})
+            queue.append(_q["id"])
+        for _w in (ev.get("written_end") or []):
+            queue.append({"type": "written", "data": _w})
+        s_ev, title = None, f"🔁 <b>{html.escape(ev['name'])}</b> — {len(ev['questions'])} سؤال"
+    n_polls = len([x for x in queue if not isinstance(x, dict)])
+    s = {
+        "eid": eid, "ev": s_ev, "practice": True, "year": ev["year"], "queue": queue, "total": n_polls,
+        "answered": 0, "correct": 0, "delivered": 0, "duration": 0.0, "started_at": time.time(),
+        "current_poll_id": None, "current_correct_id": None, "current_option_count": None,
+        "grading": grading,
+    }
+    EVENT_SESSIONS[uid] = s
+    await query.edit_message_text(
+        f"{title}، هيتبعتولك واحد واحد 👇\n"
+        + ("🏁 التصحيح مرة واحدة في الآخر" if grading == "end" else "⚡ التصحيح أول بأول")
+        + "\n🔁 <i>تدريب — مش بيتحسب في الترتيب</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    if not await _event_send_next(context, uid, s):
+        EVENT_SESSIONS.pop(uid, None)
+        await context.bot.send_message(chat_id=uid, text="⚠️ معرفتش أبعت الأسئلة دلوقتي — جرّب تاني بعد شوية.")
 
 # ═══════════════════════════════════════════════════════════════
 # LECTURE PICKER — events: "how many questions?" then "which lectures?";
@@ -12932,12 +13310,17 @@ def _event_menu_view(eid: str, ev: dict):
     ]
     if not ev.get("live") and _event_has_items(ev):
         rows.append([InlineKeyboardButton("🚀 Publish", callback_data=f"evta_pubd:{eid}")])
+    if _event_hidden(ev):
+        rows.append([InlineKeyboardButton("⏩ Reveal results now", callback_data=f"evta_rvl:{eid}")])
     rows.append([InlineKeyboardButton("🔙 رجوع للـ Events", callback_data="evta_el")])
     text = (
         f"<b>{html.escape(ev['name'])}</b>\n"
         f"{head} · {state} · " + ("1️⃣ مرة واحدة" if _event_is_once(ev) else "🔓 Unlocked") + "\n"
         f"📝 {n} سؤال" + (f" + ✍️ {_event_written_count(ev)} مكتوب" if _event_written_count(ev) else "") + f" · 👥 {taken} حلّوه\n"
         + (f"🎚 Level {_event_min_level(ev)}+" if _event_min_level(ev) else "🎚 مفيش شرط Level")
+        + {"live": "\n⚡ التصحيح أول بأول", "end": "\n🏁 التصحيح في الآخر"}.get(ev.get("grading") or "live", "")
+        + (f"\n⏳ النتيجة: {_event_reveal_text(ev.get('reveal_at'))}" + (" ✅ ظهرت" if ev.get("revealed") else "")
+           if _event_is_timed(ev) else "")
     )
     return text, InlineKeyboardMarkup(rows)
 
@@ -12981,7 +13364,8 @@ def _event_lb_manage_view(eid: str, ev: dict, page: int = 0):
     lines.append("")
     rows = []
     for i, r in enumerate(ranked[a:b], a + 1):
-        lines.append(f"{i}. {html.escape(r['name'])} — {r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}")
+        lines.append(_lb_row(i - 1, r["name"], r["user_id"],
+                             f"{r['correct']}/{r['total']} · ⏱️ {_format_duration(r['duration'])}"))
         rows.append([InlineKeyboardButton(f"🗑 {i}. {r['name'][:30]}", callback_data=f"evta_lbd:{eid}:{r['user_id']}")])
     if not ranked:
         lines.append("📭 الـ leaderboard فاضي.")
@@ -13041,7 +13425,7 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "evta_el", "evta_ev", "evta_ql", "evta_qs", "evta_ed", "evta_edc", "evta_edp", "evta_rm",
         "evta_qd", "evta_qdok", "evta_ins", "evta_add", "evta_ren", "evta_dsc", "evta_srch", "evta_pubd",
         "evta_lb", "evta_purge", "evta_purgeok",
-        "evta_lbm", "evta_lbd", "evta_lbdok", "evta_lba", "evta_lve",
+        "evta_lbm", "evta_lbd", "evta_lbdok", "evta_lba", "evta_lve", "evta_rvl",
     }:
         return False
 
@@ -13083,6 +13467,14 @@ async def _event_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         AWAITING_EVENT_EDIT.pop(uid, None)
 
     if cmd == "evta_ev":
+        text, markup = _event_menu_view(eid, ev)
+        await send(text, markup)
+        return True
+
+    if cmd == "evta_rvl":   # ⏩ reveal a timed event's results right now
+        if _event_hidden(ev) and ev.get("live"):
+            n = await _event_reveal(context, eid, ev)
+            await admin_log(context, "⏩ Event results revealed early", f"{html.escape(ev['name'])} — {n} طالب", uid)
         text, markup = _event_menu_view(eid, ev)
         await send(text, markup)
         return True
@@ -13903,7 +14295,8 @@ def _lb_board_view(year: str, page: int = 0):
         lines.append("مفيش حد على اللوحة لسه.")
     for i, r in enumerate(ranked[p_start:p_end], p_start):
         label = f"{i + 1}. {r['name']} — {r['correct']}/{r['total']} ✅ · ⏱️ {_format_duration(r['duration'])}"
-        lines.append(html.escape(label))
+        lines.append(_lb_row(i, r["name"], r["user_id"],
+                             f"{r['correct']}/{r['total']} · ⏱️ {_format_duration(r['duration'])}"))
         buttons.append([InlineKeyboardButton(f"🗑 {label}"[:60], callback_data=f"lbe_r:{year}:{r['user_id']}")])
     lines.append("\nدوس على اسم عشان تمسحه، أو ➕ عشان تضيف.")
     nav = _lb_nav_row(f"lbe_p:{year}", page, pages)
@@ -14641,9 +15034,30 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             AWAITING_EVENT_LEVEL.pop(real_uid, None)
             EVENT_PICK[real_uid]["min_level"] = int(raw_lvl)
 
-            async def _lvl_send(t, m=None):
+            await update.message.reply_text(
+                _EVENT_GRADING_PROMPT, parse_mode=ParseMode.HTML, reply_markup=_event_grading_markup(),
+            )
+            return
+
+    # ── /event_start: waiting on the time the results appear (⏳ correction) ──
+    if AWAITING_EVENT_REVEAL.get(real_uid):
+        if not is_admin(update) or real_uid not in EVENT_PICK:
+            AWAITING_EVENT_REVEAL.pop(real_uid, None)
+        else:
+            ts = _parse_event_reveal_time(text)
+            if ts is None:
+                await update.message.reply_text(
+                    "⚠️ مفهمتش الوقت (أو الوقت ده عدّى) — ابعته تاني، مثلاً <code>21:30</code> أو <code>+3h</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            AWAITING_EVENT_REVEAL.pop(real_uid, None)
+            EVENT_PICK[real_uid]["reveal_at"] = ts
+
+            async def _rv_send(t, m=None):
                 await update.message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
-            await _event_pick_step(context, real_uid, None, _lvl_send)
+            await _rv_send(f"⏳ النتيجة هتظهر: <b>{_event_reveal_text(ts)}</b>")
+            await _event_pick_step(context, real_uid, None, _rv_send)
             return
 
     # ── /edit_daily ➕ authoring in progress (owns this admin's texts) ──
@@ -15111,6 +15525,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=settings_menu_keyboard(real_uid, page=2),
                 )
             return
+        forced = (not onboarding) and _has_bad_nickname(real_uid)   # renaming because of the gate
+        bad_nick = _nickname_problem(nickname)
+        if bad_nick:
+            if onboarding:
+                AWAITING_NICKNAME[real_uid] = "onboarding"
+                await _flow_onboarding_message(update, context, real_uid, bad_nick)
+            elif forced:
+                AWAITING_NICKNAME[real_uid] = True   # no menu to fall back to — just retype it
+                await update.message.reply_text(bad_nick)
+            else:
+                await update.message.reply_text(
+                    bad_nick, reply_markup=settings_menu_keyboard(real_uid, page=2),
+                )
+            return
         if _contains_vulgar_word(nickname):
             if onboarding:
                 # Same re-ask pattern as the empty-name case above — no
@@ -15122,10 +15550,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                 )
             else:
+                if forced:
+                    AWAITING_NICKNAME[real_uid] = True
                 await update.message.reply_text(
                     quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!"),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=settings_menu_keyboard(real_uid, page=2),
+                    reply_markup=None if forced else settings_menu_keyboard(real_uid, page=2),
                 )
             return
         entry = _get_settings_entry(real_uid)
@@ -16290,11 +16720,8 @@ def _lecture_preview_view(
         medals = ["🥇", "🥈", "🥉"]
         lines.append("🏆 <b>أفضل النتائج:</b>" + (f" (صفحة {page + 1}/{pages})" if pages > 1 else ""))
         for i, row in enumerate(board[p_start:p_end], p_start):
-            medal = medals[i] if i < len(medals) else f"{i + 1}."
-            lines.append(
-                f"{medal} {html.escape(row['nickname'])} — "
-                f"{row['best_correct']}/{row['best_total']} ({row['best_pct']}%)"
-            )
+            lines.append(_lb_row(i, row["nickname"], row["user_id"],
+                                 f"{row['best_correct']}/{row['best_total']} ({row['best_pct']}%)"))
     else:
         lines.append("🏆 محدش خد المحاضرة دي لسه — يلا كن أول واحد!")
 
@@ -18649,11 +19076,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page_rows   = rows[start:start + page_size]
 
             lines = [title, reset_line, ""]
-            for i, r in enumerate(page_rows, start + 1):
-                lines.append(
-                    f"{i}# {html.escape(r['name'])} — {r['correct']} ✅ · {r['accuracy']:.0f}% دقة"
-                )
-                lines.append(f"      ⭐ Lv {r['level']} · <i>{html.escape(r['title'])}</i>")
+            for i, r in enumerate(page_rows, start):
+                lines.append(_lb_row(i, r["name"], r["user_id"],
+                                     f"{r['correct']} ✅ · {r['accuracy']:.0f}% دقة"))
             text = "\n".join(lines)
 
             nav_buttons = []
@@ -18695,10 +19120,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page_rows   = rows[start:start + page_size]
 
             lines = [title]
-            for i, r in enumerate(page_rows, start + 1):
-                lines.append(
-                    f"{i}# {html.escape(r['name'])} — {r['correct']} ✅ · {r['accuracy']:.0f}% دقة"
-                )
+            for i, r in enumerate(page_rows, start):
+                lines.append(_lb_row(i, r["name"], r["user_id"],
+                                     f"{r['correct']} ✅ · {r['accuracy']:.0f}% دقة"))
             text = "\n".join(lines)
 
             nav_buttons = []
@@ -22011,12 +22435,13 @@ BROADCAST_SEND_DELAY             = 0.05  # (legacy) no longer used by the send l
 BROADCAST_RATE_PER_SEC = float(os.environ.get("BROADCAST_RATE", "15"))
 BROADCAST_WORKERS      = int(os.environ.get("BROADCAST_WORKERS", "6"))
 
-BROADCAST_AUDIENCE_ORDER  = ["all", "mfm", "mnu", "y1", "y2", "y3", "n1", "n2", "n3", "active", "inactive"]
+BROADCAST_AUDIENCE_ORDER  = ["all", "mfm", "mnu", "y1", "y2", "y3", "n1", "n2", "n3", "active", "inactive", "nonick"]
 BROADCAST_AUDIENCE_LABELS = {
     "all": "All users", "mfm": "MFM (all)", "mnu": "MNU (all)",
     "y1": "MFM Year 1", "y2": "MFM Year 2", "y3": "MFM Year 3",
     "n1": "MNU Year 1", "n2": "MNU Year 2", "n3": "MNU Year 3",
     "active": "Active users", "inactive": "Inactive users",
+    "nonick": "No nickname set",
 }
 
 def _broadcast_default_audience(admin_id: int) -> str:
@@ -22028,7 +22453,8 @@ def _broadcast_default_audience(admin_id: int) -> str:
 def _broadcast_audiences_for(admin_id: int) -> list:
     """The audience keys this admin may pick: everything for the
     superadmin; for a university admin only their university, its years,
-    and active/inactive (which are narrowed to their university)."""
+    and active/inactive (which are narrowed to their university). "nonick"
+    (users with no nickname, who also have no university yet) is superadmin-only."""
     unis = admin_universities(admin_id)
     if unis is None:
         return list(BROADCAST_AUDIENCE_ORDER)
@@ -22070,6 +22496,10 @@ def _broadcast_audience_user_ids_all(audience: str) -> list:
         return [uid for uid in USERS if get_university(uid) == audience]
     if audience in YEAR_ORDER:
         return [uid for uid in USERS if get_year_class(uid) == audience]
+    if audience == "nonick":
+        # started the bot but never finished the nickname step of onboarding (no uni/year yet either,
+        # so only the superadmin gets this audience — see _broadcast_audiences_for)
+        return [uid for uid in USERS if not has_nickname(uid)]
     if audience in ("active", "inactive"):
         from datetime import timezone
         cutoff = (datetime.now(timezone.utc) - timedelta(days=BROADCAST_ACTIVE_WINDOW_DAYS)).strftime("%Y-%m-%d")
@@ -23903,6 +24333,7 @@ async def _post_init(app):
         )
         app.job_queue.run_repeating(_stats_flush_job, interval=60, first=60)
         app.job_queue.run_repeating(_scheduled_broadcast_job, interval=20, first=20)
+        app.job_queue.run_repeating(_event_reveal_job, interval=20, first=25)   # ⏳ timed events: reveal when due
         app.job_queue.run_repeating(_backup_trailing_job, interval=60, first=90)
         app.job_queue.run_repeating(_memory_trim_job, interval=300, first=180)
         app.job_queue.run_repeating(_prune_question_meta_job, interval=1800, first=600)
@@ -24490,6 +24921,63 @@ async def _onboarding_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app.add_handler(MessageHandler(filters.ALL, _onboarding_gate), group=-1)
 app.add_handler(CallbackQueryHandler(_onboarding_gate), group=-1)
 
+# ── Bad-nickname gate ─────────────────────────────────────────────
+# People who registered before the nickname rules (fewer than NICKNAME_MIN_LETTERS letters, or
+# only dots / emojis) can't use the bot until they pick a new one: whatever they tap or send in
+# a private chat gets Quizzy's "change your nickname" card instead. Runs after _onboarding_gate,
+# so people with NO nickname still go through onboarding first.
+NICK_FIX_CB = "fix_nick"
+_NICK_GATE_POLL_LAST: dict = {}   # uid -> last time a poll answer triggered the card (rate limit)
+
+def _has_bad_nickname(uid: int) -> bool:
+    nick = get_nickname(uid)
+    return nick is not None and _nickname_problem(str(nick)) is not None
+
+def _nickname_gate_card() -> tuple[str, InlineKeyboardMarkup]:
+    text = quizzy_block(
+        QUIZZY_ANNOYED_ART,
+        "HEY!\nyour username is... boring.\nclick here to change it (لازم تغير أسمك قبل ما تستخدم البوت )",
+    )
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Change Nickname", callback_data=NICK_FIX_CB)]])
+
+async def _nickname_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return   # groups/channels (backup, report, quiz chats...) are never gated
+    uid = user.id
+    query = update.callback_query
+
+    if query and (query.data or "") == NICK_FIX_CB:
+        if not _has_bad_nickname(uid):
+            await query.answer("اسمك تمام ✅", show_alert=True)   # stale button
+            raise ApplicationHandlerStop
+        AWAITING_NICKNAME[uid] = True   # same flow as Settings -> Edit Nickname
+        await query.answer()
+        await query.edit_message_text(
+            quizzy_block(
+                QUIZZY_HAPPY_ART,
+                "What will be your new nickname?!\nyou can always change it back from the Settings!\n"
+                "(لازم الأسم يكون من 3-32 حرف وممنوع النقط أو الأيموجيز لوحدها)",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        raise ApplicationHandlerStop
+
+    if not _has_bad_nickname(uid):
+        return
+    if update.message and AWAITING_NICKNAME.get(uid):
+        return   # this is the nickname reply itself — the text handler validates it
+
+    text, markup = _nickname_gate_card()
+    if query:
+        await query.answer()
+    await context.bot.send_message(chat_id=chat.id, text=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    raise ApplicationHandlerStop
+
+app.add_handler(MessageHandler(filters.ALL, _nickname_gate), group=-1)
+app.add_handler(CallbackQueryHandler(_nickname_gate), group=-1)
+
 async def _poll_answer_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Poll answers skip the message/callback gates above, so someone
     without a nickname could still finish quizzes and land on a board.
@@ -24499,7 +24987,18 @@ async def _poll_answer_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = pa.user.id
     if has_nickname(uid) and get_year_class(uid) in YEAR_CLASS_NUMBER:
-        return
+        if not _has_bad_nickname(uid):
+            return
+        # registered, but with a nickname the rules no longer allow: drop the answer and show the
+        # change-nickname card (at most once every 30s so a run of answers doesn't spam it)
+        if time.time() - _NICK_GATE_POLL_LAST.get(uid, 0) > 30:
+            _NICK_GATE_POLL_LAST[uid] = time.time()
+            try:
+                _t, _m = _nickname_gate_card()
+                await context.bot.send_message(uid, _t, parse_mode=ParseMode.HTML, reply_markup=_m)
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
     try:
         await context.bot.send_message(
             uid, "⚠️ لازم تعمل /start الأول وتسجل اسمك وسنتك/فرقتك قبل أي حاجة تانية."
